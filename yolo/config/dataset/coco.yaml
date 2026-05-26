@@ -1,4 +1,4 @@
-path: data/coco
+path: /scratch/sjc-advdev01/ml/datasets/coco
 train: train2017
 validation: val2017
 

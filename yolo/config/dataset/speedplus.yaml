@@ -1,0 +1,8 @@
+path: /scratch/sjc-advdev01/ml/datasets/speedplusv2
+train_folder: synthetic
+val_folder: ['synthetic','lightbox','sunlamp']
+images: images_768x512_RGB
+
+class_num: 1
+class_list: ['Spacecraft']
+

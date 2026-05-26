@@ -49,7 +49,7 @@ class YoloDataset(Dataset):
         Returns:
             dict: The loaded data from the cache for the specified phase.
         """
-        cache_path = dataset_path / f"{phase_name}.pache"
+        cache_path = dataset_path / f"{phase_name}.cache"
 
         if not cache_path.exists():
             logger.info(f":factory: Generating {phase_name} cache")
@@ -198,6 +198,72 @@ class YoloDataset(Dataset):
         return len(self.bboxes)
 
 
+class SpeedPlusDataset(YoloDataset):
+    def __init__(self, data_cfg: DataConfig, dataset_cfg: DatasetConfig, phase: str, folder: str):
+        augment_cfg = data_cfg.data_augment
+        self.image_size = data_cfg.image_size
+        phase_name = dataset_cfg.get(phase, phase)
+        self.batch_size = data_cfg.batch_size
+        self.dynamic_shape = getattr(data_cfg, "dynamic_shape", False)
+        self.base_size = mean(self.image_size)
+
+        transforms = [eval(aug)(prob) for aug, prob in augment_cfg.items()]
+        self.transform = AugmentationComposer(transforms, self.image_size, self.base_size)
+        self.transform.get_more_data = self.get_more_data
+        self.img_paths, self.bboxes, self.ratios = tensorlize(self.load_data(Path(dataset_cfg.path)/folder, phase_name))
+
+    def filter_data(self, dataset_path: Path, phase_name: str, sort_image: bool = False) -> list:
+        """
+        Filters and collects dataset information by pairing images with their corresponding labels.
+
+        Parameters:
+            images_path (Path): Path to the directory containing image files.
+            labels_path (str): Path to the directory containing label files.
+            sort_image (bool): If True, sorts the dataset by the width-to-height ratio of images in descending order.
+
+        Returns:
+            list: A list of tuples, each containing the path to an image file and its associated segmentation as a tensor.
+        """
+        images_path = dataset_path / "images_768x512_RGB" 
+        json_path = dataset_path / f"{phase_name}.json"
+        labels_path = dataset_path / "labels" / f"{phase_name}.csv"
+        if not json_path.exists():
+            json_path = dataset_path / "test.json"
+            labels_path = dataset_path / "labels" / "test.csv"
+        
+        import json
+        with open(json_path, "r") as file:
+            files_data = json.load(file)
+        import csv
+        labels_data = []
+        with open(labels_path, "r") as file:
+            reader = csv.reader(file)
+            for row in reader:
+                label = [row[0]]+[float(val) for val in row[1:]]
+                labels_data.append(label) 
+        images_list = [label[0] for label in labels_data]
+
+        data = []
+        valid_inputs = 0
+        for idx, label in enumerate(labels_data):  #enumerate(track(images_list, description="Filtering data")):
+            image_name = label[0]
+            image_id = Path(image_name).stem
+
+            image_seg_annotations = [[0]+label[1:5]]    # eventually add the other elements
+
+            labels = self.load_valid_labels(image_id, image_seg_annotations)
+            img_path = images_path / image_name
+            data.append((img_path, labels, 0))
+            if len(image_seg_annotations) != 0:
+                valid_inputs += 1
+
+        #data = sorted(data, key=lambda x: x[2], reverse=True)
+
+        logger.info(f"Recorded {valid_inputs}/{len(images_list)} valid inputs")
+        return data
+
+
+
 def collate_fn(batch: List[Tuple[Tensor, Tensor]]) -> Tuple[Tensor, List[Tensor]]:
     """
     A collate function to handle batching of images and their corresponding targets.
@@ -234,15 +300,40 @@ def create_dataloader(data_cfg: DataConfig, dataset_cfg: DatasetConfig, task: st
 
     if getattr(dataset_cfg, "auto_download", False):
         prepare_dataset(dataset_cfg, task)
-    dataset = YoloDataset(data_cfg, dataset_cfg, task)
+    if 'speedplus' in dataset_cfg.path:
+        if task=='validation':
+            data_loaders = []
+            for val_folder in dataset_cfg.val_folder:
+                dataset = SpeedPlusDataset(data_cfg, dataset_cfg, task, val_folder)
+                data_loaders.append(DataLoader(
+                    dataset,
+                    batch_size=data_cfg.batch_size,
+                    num_workers=data_cfg.cpu_num,
+                    pin_memory=data_cfg.pin_memory,
+                    collate_fn=collate_fn,
+                ))
+            return data_loaders
+        else:
+            dataset = SpeedPlusDataset(data_cfg, dataset_cfg, task, dataset_cfg.train_folder)
+            return DataLoader(
+                dataset,
+                batch_size=data_cfg.batch_size,
+                num_workers=data_cfg.cpu_num, #MCHP set to 0 to debug
+                pin_memory=data_cfg.pin_memory,
+                collate_fn=collate_fn,
+            )
+            
 
-    return DataLoader(
-        dataset,
-        batch_size=data_cfg.batch_size,
-        num_workers=data_cfg.cpu_num,
-        pin_memory=data_cfg.pin_memory,
-        collate_fn=collate_fn,
-    )
+    else:
+        dataset = YoloDataset(data_cfg, dataset_cfg, task)
+
+        return DataLoader(
+            dataset,
+            batch_size=data_cfg.batch_size,
+            num_workers=data_cfg.cpu_num,
+            pin_memory=data_cfg.pin_memory,
+            collate_fn=collate_fn,
+        )
 
 
 class StreamDataLoader:

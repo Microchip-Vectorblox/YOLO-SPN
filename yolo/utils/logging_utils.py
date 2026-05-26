@@ -21,7 +21,7 @@ import numpy as np
 import torch
 import wandb
 from lightning import LightningModule, Trainer, seed_everything
-from lightning.pytorch.callbacks import Callback, RichModelSummary, RichProgressBar
+from lightning.pytorch.callbacks import Callback, RichModelSummary, RichProgressBar, ModelCheckpoint
 from lightning.pytorch.callbacks.progress.rich_progress import CustomProgress
 from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
 from lightning.pytorch.utilities import rank_zero_only
@@ -106,7 +106,7 @@ class YOLORichProgressBar(RichProgressBar):
         epoch_descript = "[cyan]Train [white]|"
         batch_descript = "[green]Batch [white]|"
         metrics = self.get_metrics(trainer, pl_module)
-        metrics.pop("v_num")
+        metrics.pop("v_num", None)
         for metrics_name, metrics_val in metrics.items():
             if "Loss_step" in metrics_name:
                 epoch_descript += f"{metrics_name.removesuffix('_step').split('/')[1]: ^9}|"
@@ -118,7 +118,7 @@ class YOLORichProgressBar(RichProgressBar):
 
     @override
     @rank_zero_only
-    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0) -> None:
         if self.is_disabled:
             return
         if trainer.sanity_checking:
@@ -157,7 +157,7 @@ class YOLORichProgressBar(RichProgressBar):
         self.past_results.append((trainer.current_epoch, ap_main))
 
     @override
-    def refresh(self) -> None:
+    def refresh(self, hard=None) -> None:
         if self.progress:
             self.progress.refresh()
 
@@ -221,7 +221,7 @@ class YOLORichModelSummary(RichModelSummary):
 
 
 class ImageLogger(Callback):
-    def on_validation_batch_end(self, trainer: Trainer, pl_module, outputs, batch, batch_idx) -> None:
+    def on_validation_batch_end(self, trainer: Trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0) -> None:
         if batch_idx != 0:
             return
         batch_size, images, targets, rev_tensor, img_paths = batch
@@ -285,10 +285,14 @@ def setup(cfg: Config):
     progress.append(YOLORichModelSummary())
     progress.append(ImageLogger())
     if cfg.use_tensorboard:
-        loggers.append(TensorBoardLogger(log_graph="all", save_dir=save_path))
+        print('save_path = '+str(save_path))
+        loggers.append(TensorBoardLogger(log_graph="all", save_dir=str(save_path)))
     if cfg.use_wandb:
         wandb_cfg = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
         loggers.append(WandbLogger(project="YOLO", name=cfg.name, save_dir=save_path, id=None, config=wandb_cfg))
+
+    checkpoint_callback = ModelCheckpoint(save_top_k=-1)
+    progress.append(checkpoint_callback)
 
     return progress, loggers, save_path
 

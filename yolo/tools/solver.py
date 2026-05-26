@@ -30,9 +30,18 @@ class ValidateModel(BaseModel):
             self.validation_cfg = self.cfg.task
         else:
             self.validation_cfg = self.cfg.task.validation
-        self.metric = MeanAveragePrecision(iou_type="bbox", box_format="xyxy", backend="faster_coco_eval")
-        self.metric.warn_on_many_detections = False
         self.val_loader = create_dataloader(self.validation_cfg.data, self.cfg.dataset, self.validation_cfg.task)
+        if isinstance(self.val_loader, list):
+            self.metric = []
+            self.val_label = []
+            for folder in self.cfg.dataset.val_folder:
+                self.metric.append(MeanAveragePrecision(iou_type="bbox", box_format="xyxy", backend="faster_coco_eval"))
+                self.metric[-1].warn_on_many_detections = False
+                self.val_label.append(folder)
+        else:
+            self.val_label = ['val']
+            self.metric = [MeanAveragePrecision(iou_type="bbox", box_format="xyxy", backend="faster_coco_eval")]
+            self.metric[-1].warn_on_many_detections = False
         self.ema = self.model
 
     def setup(self, stage):
@@ -44,25 +53,27 @@ class ValidateModel(BaseModel):
     def val_dataloader(self):
         return self.val_loader
 
-    def validation_step(self, batch, batch_idx):
+    def validation_step(self, batch, batch_idx, dataloader_idx=0):
         batch_size, images, targets, rev_tensor, img_paths = batch
         H, W = images.shape[2:]
         predicts = self.post_process(self.ema(images), image_size=[W, H])
-        mAP = self.metric(
+        mAP = self.metric[dataloader_idx](
             [to_metrics_format(predict) for predict in predicts], [to_metrics_format(target) for target in targets]
         )
         return predicts, mAP
 
     def on_validation_epoch_end(self):
-        epoch_metrics = self.metric.compute()
-        del epoch_metrics["classes"]
-        self.log_dict(epoch_metrics, prog_bar=True, sync_dist=True, rank_zero_only=True)
-        self.log_dict(
-            {"PyCOCO/AP @ .5:.95": epoch_metrics["map"], "PyCOCO/AP @ .5": epoch_metrics["map_50"]},
-            sync_dist=True,
-            rank_zero_only=True,
-        )
-        self.metric.reset()
+        for n,label in enumerate(self.val_label):
+            epoch_metrics = self.metric[n].compute()
+            del epoch_metrics["classes"]
+            if n==0:
+                self.log_dict(epoch_metrics, prog_bar=True, sync_dist=True, rank_zero_only=True)
+            self.log_dict(
+                {"val/"+label+"@.5:.95": epoch_metrics["map"], "val/"+label+"@.5": epoch_metrics["map_50"]},
+                sync_dist=True,
+                rank_zero_only=True,
+            )
+            self.metric[n].reset()
 
 
 class TrainModel(ValidateModel):
@@ -105,7 +116,7 @@ class TrainModel(ValidateModel):
         optimizer = create_optimizer(self.model, self.cfg.task.optimizer)
         scheduler = create_scheduler(optimizer, self.cfg.task.scheduler)
         return [optimizer], [scheduler]
-
+    
 
 class InferenceModel(BaseModel):
     def __init__(self, cfg: Config):
