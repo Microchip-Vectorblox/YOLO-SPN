@@ -226,7 +226,7 @@ class ImageLogger(Callback):
             return
         batch_size, images, targets, rev_tensor, img_paths = batch
         predicts, _ = outputs
-        gt_boxes = targets[0] if targets.ndim == 3 else targets
+        gt_boxes = targets['bboxes'][0] if targets['bboxes'].ndim == 3 else targets['bboxes']
         pred_boxes = predicts[0] if isinstance(predicts, list) else predicts
         images = [images[0]]
         step = trainer.current_epoch

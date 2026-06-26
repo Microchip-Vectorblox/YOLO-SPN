@@ -6,7 +6,7 @@ import torch
 from omegaconf import ListConfig, OmegaConf
 from torch import nn
 
-from yolo.config.config import ModelConfig, YOLOLayer
+from yolo.config.config import ModelConfig, YOLOLayer, DatasetConfig
 from yolo.tools.dataset_preparation import prepare_weight
 from yolo.utils.logger import logger
 from yolo.utils.module_utils import get_layer_map
@@ -46,7 +46,7 @@ class YOLO(nn.Module):
                 # Find in channels
                 if any(module in layer_type for module in ["Conv", "ELAN", "ADown", "AConv", "CBLinear"]):
                     layer_args["in_channels"] = output_dim[source]
-                if any(module in layer_type for module in ["Detection", "Segmentation", "Classification"]):
+                if any(module in layer_type for module in ["Detection", "Segmentation", "Classification", "SpacecraftPose"]):
                     if isinstance(source, list):
                         layer_args["in_channels"] = [output_dim[idx] for idx in source]
                     else:
@@ -164,7 +164,7 @@ class YOLO(nn.Module):
         self.model.load_state_dict(model_state_dict)
 
 
-def create_model(model_cfg: ModelConfig, weight_path: Union[bool, Path] = True, class_num: int = 80) -> YOLO:
+def create_model(model_cfg: ModelConfig, weight_path: Union[bool, Path] = True, class_num: int = 80, dataset_cfg: DatasetConfig = None) -> YOLO:
     """Constructs and returns a model from a Dictionary configuration file.
 
     Args:
@@ -175,6 +175,16 @@ def create_model(model_cfg: ModelConfig, weight_path: Union[bool, Path] = True, 
     """
     OmegaConf.set_struct(model_cfg, False)
     model = YOLO(model_cfg, class_num)
+    if dataset_cfg:
+        camera_path = Path(dataset_cfg.path) / dataset_cfg.camera
+        #cadmodel_path = Path(dataset_cfg.path) / dataset_cfg.cadmodel
+        model.camera = load_camera_intrinsics(camera_path)
+        #model_points = load_cad_model(cadmodel_path, num_points=500) # [Np, 3]
+        #model_points = torch.from_numpy(model_points).t() # [3, Np]
+        #self.register_buffer('model_points', model_points)
+        #self.pose_loss = TransformationLoss(self.model_points)
+        keypoints_path = Path(dataset_cfg.path) / dataset_cfg.keypoints
+        model.keypts3d = load_tango_3d_keypoints(keypoints_path) # (11, 3) [m]
     if weight_path:
         if weight_path == True:
             weight_path = Path("weights") / f"{model_cfg.name}.pt"
@@ -190,3 +200,27 @@ def create_model(model_cfg: ModelConfig, weight_path: Union[bool, Path] = True, 
     else:
         logger.info(":white_check_mark: Success load model")
     return model
+
+def load_camera_intrinsics(camera_json):
+    import json
+    import numpy as np
+    with open(camera_json) as f:
+        cam = json.load(f)
+
+    # Into np.array
+    cam = {
+        k: np.array(v, dtype=np.float32) for k, v in cam.items()
+    }
+
+    # Compute horizontal FOV
+    cam["horizontalFOV"] = 2 * np.arctan2(0.5 * cam["ppx"] * cam["Nu"], cam["fx"])
+
+    return cam
+
+def load_tango_3d_keypoints(mat_dir):
+    from scipy.io import loadmat
+    import numpy as np
+    vertices  = loadmat(mat_dir)['tango3Dpoints'] # [3 x 11]
+    corners3D = np.transpose(np.array(vertices, dtype=np.float32)) # [11 x 3]
+
+    return corners3D

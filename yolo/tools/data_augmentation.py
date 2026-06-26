@@ -23,14 +23,67 @@ class AugmentationComposer:
             if hasattr(transform, "set_parent"):
                 transform.set_parent(self)
 
-    def __call__(self, image, boxes=torch.zeros(0, 5)):
+    def __call__(self, image, targets):
         for transform in self.transforms:
-            image, boxes = transform(image, boxes)
-        image, boxes, rev_tensor = self.pad_resize(image, boxes)
+            image, targets = transform(image, targets)
+        image, targets, rev_tensor = self.pad_resize(image, targets)
         image = TF.to_tensor(image)
-        return image, boxes, rev_tensor
+        return image, targets, rev_tensor
+
+##########################
+class CoarseDropout:
+
+    def __init__(
+        self,
+        prob: float = 0.5,
+        max_holes: int = 5,
+        min_holes: int = 1,
+        max_ratio: float = 0.5,
+        min_ratio: float = 0.2,
+    ):
+        self.prob = prob
+        self.max_holes = max_holes
+        self.min_holes = min_holes
+        self.max_ratio = max_ratio
+        self.min_ratio = min_ratio
+        if not 0 < self.min_holes <= self.max_holes:
+            raise ValueError("Invalid combination of min_holes and max_holes. Got: {}".format([min_holes, max_holes]))
+
+    def __call__(self, image, targets):
+        if torch.rand(1) < self.prob:
+            fill_value = random.randint(0,255)
+            img = np.array(image)
+            height, width = img.shape[:2]
+            bbox = targets["bboxes"][0] # Single object [xmin, ymin, xmax, ymax] (normalized)
+    
+            xmin = int(width * bbox[1])
+            ymin = int(height * bbox[2])
+            xmax = int(width * bbox[3])
+            ymax = int(height * bbox[4])
+    
+            # Min/Max Height/Width
+            min_height = int(self.min_ratio * (ymax - ymin))
+            max_height = int(self.max_ratio * (ymax - ymin))
+            min_width  = int(self.min_ratio * (xmax - xmin))
+            max_width  = int(self.max_ratio * (xmax - xmin))
+    
+            for _n in range(random.randint(self.min_holes, self.max_holes)):
+    
+                hole_height = random.randint(min_height, max_height)
+                hole_width = random.randint(min_width, max_width)
+    
+                y1 = random.randint(ymin, ymax - hole_height)
+                x1 = random.randint(xmin, xmax - hole_width)
+                y2 = y1 + hole_height
+                x2 = x1 + hole_width
+            
+                img[y1:y2,x1:x2,:] = fill_value
+
+            image = Image.fromarray(img)
+        return image, targets
 
 
+##########################
 class RandomSunFlare(A.DualTransform):
     """Simulates Sun Flare for the image
     From https://github.com/UjjwalSaxena/Automold--Road-Augmentation-Library
@@ -197,25 +250,26 @@ class RandomContrast:
 
 
 class GaussianBlur:
-    def __init__(self, prob=0.5, kernel_size=5):
+    def __init__(self, prob=0.5):
         self.prob = prob
-        self.kernel_size = kernel_size
 
     def __call__(self, image, boxes):
         if torch.rand(1) < self.prob:
-            image = TF.gaussian_blur(image, self.kernel_size)
+            kernel_size = np.random.randint(0,2)*2+3
+            image = TF.gaussian_blur(image, kernel_size)
         return image, boxes
 
 
 class GaussianNoise:
-    def __init__(self, prob=0.5, std=5):
+    def __init__(self, prob=0.5, max_std=7):
         self.prob = prob
-        self.std = std
+        self.max_std = max_std
 
     def __call__(self, image, boxes):
         if torch.rand(1) < self.prob:
             image_np = np.array(image)
-            noise = self.std*np.random.randn(*image_np.shape)
+            std = np.random.uniform(0,self.max_std)
+            noise = std*np.random.randn(*image_np.shape)
             image_np = np.clip(image_np + noise, 0, 255).astype(np.uint8)
             image = Image.fromarray(image_np)
         return image, boxes
@@ -256,7 +310,8 @@ class PadAndResize:
     def set_size(self, image_size: List[int]):
         self.target_width, self.target_height = image_size
 
-    def __call__(self, image: Image, boxes):
+    def __call__(self, image: Image, targets):
+        boxes = targets['bboxes']
         img_width, img_height = image.size
         scale = min(self.target_width / img_width, self.target_height / img_height)
         new_width, new_height = int(img_width * scale), int(img_height * scale)
@@ -272,8 +327,26 @@ class PadAndResize:
         boxes[:, [2, 4]] = (boxes[:, [2, 4]] * new_height + pad_top) / self.target_height
 
         transform_info = torch.tensor([scale, pad_left, pad_top, pad_left, pad_top])
-        return padded_image, boxes, transform_info
+        return padded_image, targets, transform_info
 
+
+class HorizontalVerticalFlip:
+    """Randomly horizontally flips the image along with the bounding boxes."""
+
+    def __init__(self, prob=0.5):
+        self.prob = prob
+
+    def __call__(self, image, targets):
+        if torch.rand(1) < self.prob:
+            image = TF.hflip(image)
+            image = TF.vflip(image)
+            boxes = targets['bboxes']
+            boxes[:, [1, 3]] = 1 - boxes[:, [3, 1]]
+            boxes[:, [2, 4]] = 1 - boxes[:, [4, 2]]
+            targets['quaternion'] = targets['quaternion'][[2,1,0,3]]*torch.tensor([-1,1,1,1])
+            targets['rotationmatrix'] *= torch.tensor([[-1,-1,1],[-1,-1,1],[-1,-1,1]])
+            targets['translation'] *= torch.tensor([-1,-1,1])
+        return image, targets
 
 class HorizontalFlip:
     """Randomly horizontally flips the image along with the bounding boxes."""

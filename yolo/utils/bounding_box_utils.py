@@ -7,10 +7,12 @@ from torch import Tensor, tensor
 from torchmetrics.detection import MeanAveragePrecision
 from torchvision.ops import batched_nms
 
+import torch.nn.functional as F
+import numpy as np
+
 from yolo.config.config import AnchorConfig, MatcherConfig, NMSConfig
 from yolo.model.yolo import YOLO
 from yolo.utils.logger import logger
-
 
 def calculate_iou(bbox1, bbox2, metrics="iou") -> Tensor:
     metrics = metrics.lower()
@@ -349,6 +351,8 @@ class Vec2Box:
         anchor_grid, scaler = generate_anchors(image_size, self.strides)
         self.image_size = image_size
         self.anchor_grid, self.scaler = anchor_grid.to(device), scaler.to(device)
+        self.cameraMatrix = model.camera['cameraMatrix']
+        self.original_size = (model.camera['Nu'],model.camera['Nv'])
 
     def create_auto_anchor(self, model: YOLO, image_size):
         W, H = image_size
@@ -372,20 +376,54 @@ class Vec2Box:
         self.anchor_grid, self.scaler = anchor_grid.to(self.device), scaler.to(self.device)
 
     def __call__(self, predicts):
-        preds_cls, preds_anc, preds_box = [], [], []
+        preds_cls, preds_anc, preds_box, preds_pose = [], [], [], []
         for layer_output in predicts:
-            pred_cls, pred_anc, pred_box = layer_output
+            if len(layer_output)==3:
+                pred_cls, pred_anc, pred_box = layer_output
+            else:
+                pred_cls, pred_anc, pred_box, pred_pose = layer_output
+                preds_pose.append(rearrange(pred_pose, "B X h w -> B (h w) X"))
             preds_cls.append(rearrange(pred_cls, "B C h w -> B (h w) C"))
             preds_anc.append(rearrange(pred_anc, "B A R h w -> B (h w) R A"))
             preds_box.append(rearrange(pred_box, "B X h w -> B (h w) X"))
         preds_cls = torch.concat(preds_cls, dim=1)
         preds_anc = torch.concat(preds_anc, dim=1)
         preds_box = torch.concat(preds_box, dim=1)
+        preds_pose = torch.concat(preds_pose, dim=1)
 
         pred_LTRB = preds_box * self.scaler.view(1, -1, 1)
         lt, rb = pred_LTRB.chunk(2, dim=-1)
         preds_box = torch.cat([self.anchor_grid - lt, self.anchor_grid + rb], dim=-1)
+
+        if preds_pose.numel()>0:
+            cx = preds_pose[:,:,0]*self.scaler.view(1,-1) + self.anchor_grid[:,0]
+            cy = preds_pose[:,:,1]*self.scaler.view(1,-1) + self.anchor_grid[:,1]
+            tz = preds_pose[:,:,2]
+            cx = cx*(self.original_size[0]/self.image_size[0])
+            cy = cy*(self.original_size[1]/self.image_size[1])
+            tx = (cx - self.cameraMatrix[0,2]) * tz / self.cameraMatrix[0,0]
+            ty = (cy - self.cameraMatrix[1,2]) * tz / self.cameraMatrix[1,1]
+            preds_trans =  torch.stack((tx, ty, tz), dim=-1)
+            preds_rot = preds_pose[:,:,3:]
+            return preds_cls, preds_anc, preds_box, preds_trans, preds_rot
         return preds_cls, preds_anc, preds_box
+
+    def delta_xy_tz_to_translation(translation_raw,
+                               image_size, input_size,
+                               anchors, strides, cameraMatrix):
+        dx, dy, tz = translation_raw[:,:,0], translation_raw[:,:,1], translation_raw[:,:,2]
+    
+        cx = dx * strides + (anchors[:,0] + anchors[:,2])/2
+        cy = dy * strides + (anchors[:,1] + anchors[:,3])/2
+    
+        # (cx, cy) are in terms of input image size, so convert to original size
+        cx = cx / input_size[0] * image_size[0]
+        cy = cy / input_size[1] * image_size[1]
+    
+        tx = (cx - cameraMatrix[0,2]) * tz / cameraMatrix[0,0]
+        ty = (cy - cameraMatrix[1,2]) * tz / cameraMatrix[1,1]
+    
+        return torch.stack((tx, ty, tz), dim=-1) # [B, N, 3]
 
 
 class Anc2Box:
@@ -477,6 +515,33 @@ def bbox_nms(cls_dist: Tensor, bbox: Tensor, nms_cfg: NMSConfig, confidence: Opt
     return predicts_nms
 
 
+def bbox_sp_nms(cls_dist: Tensor, bbox: Tensor, trans: Tensor, rot: Tensor, nms_cfg: NMSConfig, confidence: Optional[Tensor] = None):
+    cls_dist = cls_dist.sigmoid() * (1 if confidence is None else confidence)
+
+    batch_idx, valid_grid, valid_cls = torch.where(cls_dist > nms_cfg.min_confidence)
+    valid_con = cls_dist[batch_idx, valid_grid, valid_cls]
+    valid_box = bbox[batch_idx, valid_grid]
+    valid_trans = trans[batch_idx, valid_grid]
+    valid_rot = rot[batch_idx, valid_grid]
+
+    nms_idx = batched_nms(valid_box, valid_con, batch_idx + valid_cls * bbox.size(0), nms_cfg.min_iou)
+    predicts_nms = []
+    predicts_trans = []
+    predicts_rot = []
+    for idx in range(cls_dist.size(0)):
+        instance_idx = nms_idx[idx == batch_idx[nms_idx]]
+
+        predict_nms = torch.cat(
+            [valid_cls[instance_idx][:, None], valid_box[instance_idx], valid_con[instance_idx][:, None]], dim=-1
+        )
+
+        predicts_nms.append(predict_nms[: nms_cfg.max_bbox])
+        predicts_trans.append(valid_trans[instance_idx[:nms_cfg.max_bbox]])
+        predicts_rot.append(valid_rot[instance_idx[:nms_cfg.max_bbox]])
+    return predicts_nms, predicts_trans, predicts_rot
+
+
+
 def calculate_map(predictions, ground_truths) -> Dict[str, Tensor]:
     metric = MeanAveragePrecision(iou_type="bbox", box_format="xyxy")
     mAP = metric([to_metrics_format(predictions)], [to_metrics_format(ground_truths)])
@@ -489,3 +554,89 @@ def to_metrics_format(prediction: Tensor) -> Dict[str, Union[float, Tensor]]:
     if prediction.size(1) == 6:
         bbox["scores"] = prediction[:, 5]
     return bbox
+
+
+@torch.jit.script
+def rot_6d_to_matrix(r):
+    # r : (.., 6)
+    r1_raw = r[..., :3]
+    r2_raw = r[..., 3:]
+
+    # First column
+    r1 = F.normalize(r1_raw, p=2.0, dim=-1) # [..., 3]
+
+    # Second column
+    dot = torch.sum(r1 * r2_raw, dim=-1, keepdim=True)
+    r2 = r2_raw - dot * r1
+    r2 = F.normalize(r2, p=2.0, dim=-1)
+
+    # Third column
+    r3 = torch.cross(r1, r2, dim=-1)
+
+    # Into matrix
+    dcm = torch.stack((r1, r2, r3), dim=-1)
+
+    return dcm
+
+def project_keypoints(q, r, K, dist, keypoints):
+    """ Projecting 3D keypoints to 2D
+        q: quaternion (np.array) or rotation matrix
+        r: position   (np.array)
+        K: camera intrinsic (3,3) (np.array)
+        dist: distortion coefficients (5,) (np.array)
+        keypoints: N x 3 or 3 x N (np.array)
+    """
+    # Make sure keypoints are 3 x N
+    if keypoints.shape[0] != 3:
+        keypoints = np.transpose(keypoints)
+
+    if q.shape == (3,3):
+        R = q   # already in matrix form
+    else:
+        R = quat2dcm(q)
+
+    # Keypoints into 4 x N homogenous coordinates
+    keypoints = np.vstack((keypoints, np.ones((1, keypoints.shape[1]))))
+
+    # transformation to image frame
+    pose_mat = np.hstack((np.transpose(R), np.expand_dims(r, 1)))
+    xyz      = np.dot(pose_mat, keypoints) # [3 x N]
+    x0, y0   = xyz[0,:] / xyz[2,:], xyz[1,:] / xyz[2,:] # [1 x N] each
+
+    # apply distortion
+    r2 = x0*x0 + y0*y0
+    cdist = 1 + dist[0]*r2 + dist[1]*r2*r2 + dist[4]*r2*r2*r2
+    x  = x0*cdist + dist[2]*2*x0*y0 + dist[3]*(r2 + 2*x0*x0)
+    y  = y0*cdist + dist[2]*(r2 + 2*y0*y0) + dist[3]*2*x0*y0
+
+    # apply camera matrix
+    points2D = np.vstack((K[0,0]*x + K[0,2], K[1,1]*y + K[1,2]))
+
+    return points2D
+
+def quat2dcm(q):
+    """ Computing direction cosine matrix from quaternion, adapted from PyNav. """
+    # normalizing quaternion
+    q = q/np.linalg.norm(q)
+
+    q0 = q[0]
+    q1 = q[1]
+    q2 = q[2]
+    q3 = q[3]
+
+    dcm = np.zeros((3, 3), dtype=np.float32)
+
+    dcm[0, 0] = 2 * q0 ** 2 - 1 + 2 * q1 ** 2
+    dcm[1, 1] = 2 * q0 ** 2 - 1 + 2 * q2 ** 2
+    dcm[2, 2] = 2 * q0 ** 2 - 1 + 2 * q3 ** 2
+
+    dcm[0, 1] = 2 * q1 * q2 + 2 * q0 * q3
+    dcm[0, 2] = 2 * q1 * q3 - 2 * q0 * q2
+
+    dcm[1, 0] = 2 * q1 * q2 - 2 * q0 * q3
+    dcm[1, 2] = 2 * q2 * q3 + 2 * q0 * q1
+
+    dcm[2, 0] = 2 * q1 * q3 + 2 * q0 * q2
+    dcm[2, 1] = 2 * q2 * q3 - 2 * q0 * q1
+
+    return dcm

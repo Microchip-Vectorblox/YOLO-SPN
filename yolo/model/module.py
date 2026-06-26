@@ -130,6 +130,127 @@ class MultiheadDetection(nn.Module):
         return [head(x) for x, head in zip(x_list, self.heads)]
 
 
+
+# ----------- Spacecraft Pose Class ----------- #
+class SpacecraftPose(nn.Module):
+    """A single Spacecraft Pose head"""
+
+    def __init__(self, in_channels: Tuple[int], num_classes: int, *, reg_max: int = 16, use_group: bool = True):
+        super().__init__()
+
+        groups = 4 if use_group else 1
+        anchor_channels = 4 * reg_max
+        pose_channels = 9   # 6 rotation + 3 translation
+
+        first_neck, in_channels = in_channels
+        anchor_neck = max(round_up(first_neck // 4, groups), anchor_channels, reg_max)
+        class_neck = max(first_neck, min(num_classes * 2, 128))
+        pose_neck = max(first_neck,64)
+
+        self.anchor_conv = nn.Sequential(
+            Conv(in_channels, anchor_neck, 3),
+            Conv(anchor_neck, anchor_neck, 3, groups=groups),
+            nn.Conv2d(anchor_neck, anchor_channels, 1, groups=groups),
+        )
+        self.class_conv = nn.Sequential(
+            Conv(in_channels, class_neck, 3), Conv(class_neck, class_neck, 3), nn.Conv2d(class_neck, num_classes, 1)
+        )
+
+        self.pose_conv = nn.Sequential(
+            Conv(in_channels, pose_neck, 3), Conv(pose_neck, pose_neck, 3), nn.Conv2d(pose_neck, pose_channels, 1)
+        )
+
+        self.anc2vec = Anchor2Vec(reg_max=reg_max)
+
+        self.anchor_conv[-1].bias.data.fill_(1.0)
+        self.class_conv[-1].bias.data.fill_(-10)  # TODO: math.log(5 * 4 ** idx / 80 ** 3)
+
+    def forward(self, x: Tensor) -> Tuple[Tensor]:
+        anchor_x = self.anchor_conv(x)
+        class_x = self.class_conv(x)
+        pose_x = self.pose_conv(x)
+        anchor_x, vector_x = self.anc2vec(anchor_x)
+        # MCHP todo: do we need to make a vector for pose?
+        return class_x, anchor_x, vector_x, pose_x
+
+# this is an experiment to share parameters for the different strides; it didn't improve things
+class MultiheadSpacecraftPoseShared(nn.Module):
+    """Mutlihead Spacecraft Pose module"""
+    def __init__(self, in_channels: List[int], num_classes: int, *, reg_max: int = 16, use_group: bool = True):
+        super().__init__()
+
+        self.anchor_conv = nn.ModuleList()
+        self.class_conv = nn.ModuleList()
+        self.pose_conv = nn.ModuleList()
+        self.anc2vec = nn.ModuleList()
+
+        groups = 4 if use_group else 1
+        anchor_channels = 4 * reg_max
+        pose_channels = 9   # 6 rotation + 3 translation
+        
+        first_neck = in_channels[0]
+        anchor_neck = max(round_up(first_neck // 4, groups), anchor_channels, reg_max)
+        class_neck = max(first_neck, min(num_classes * 2, 128))
+        pose_neck = max(first_neck,64)
+       
+        # shared modules 
+        self.pose_conv1 = nn.Conv2d(pose_neck, pose_neck, 3, bias=False, padding=1)
+        self.pose_conv2 = nn.Conv2d(pose_neck, pose_channels, 1)
+        self.act = create_activation_function("SiLU")
+
+        for in_channel in in_channels:
+            self.anchor_conv.append(nn.Sequential(
+                Conv(in_channel, anchor_neck, 3),
+                Conv(anchor_neck, anchor_neck, 3, groups=groups),
+                nn.Conv2d(anchor_neck, anchor_channels, 1, groups=groups),
+            ))
+            self.class_conv.append(nn.Sequential(
+                Conv(in_channel, class_neck, 3), Conv(class_neck, class_neck, 3), nn.Conv2d(class_neck, num_classes, 1)
+            ))
+
+            self.pose_conv.append(nn.Sequential(
+                Conv(in_channel, pose_neck, 3), 
+                self.pose_conv1,
+                nn.BatchNorm2d(pose_neck, eps=1e-3, momentum=3e-2),
+                self.act,
+                self.pose_conv2
+            ))
+
+            self.anc2vec.append(Anchor2Vec(reg_max=reg_max))
+    
+            self.anchor_conv[-1][-1].bias.data.fill_(1.0)
+            self.class_conv[-1][-1].bias.data.fill_(-10)  # TODO: math.log(5 * 4 ** idx / 80 ** 3)
+
+
+    def forward(self, x_list: List[torch.Tensor]) -> List[torch.Tensor]:
+        #return [head(x) for x, head in zip(x_list, self.heads)]
+        ret = []
+        for head, x in enumerate(x_list):
+            anchor_x = self.anchor_conv[head](x)
+            class_x = self.class_conv[head](x)
+            pose_x = self.pose_conv[head](x)
+            anchor_x, vector_x = self.anc2vec[head](anchor_x)
+            # MCHP todo: do we need to make a vector for pose?
+            ret.append((class_x, anchor_x, vector_x, pose_x))
+        return ret
+
+
+
+class MultiheadSpacecraftPose(nn.Module):
+    """Mutlihead Spacecraft Pose module"""
+    def __init__(self, in_channels: List[int], num_classes: int, **head_kwargs):
+        super().__init__()
+
+        self.heads = nn.ModuleList(
+            [SpacecraftPose((in_channels[0], in_channel), num_classes, **head_kwargs) for in_channel in in_channels]
+        )
+
+    def forward(self, x_list: List[torch.Tensor]) -> List[torch.Tensor]:
+        return [head(x) for x, head in zip(x_list, self.heads)]
+
+
+
+
 # ----------- Segmentation Class ----------- #
 class Segmentation(nn.Module):
     def __init__(self, in_channels: Tuple[int], num_maskes: int):

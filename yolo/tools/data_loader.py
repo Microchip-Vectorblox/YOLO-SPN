@@ -120,7 +120,6 @@ class YoloDataset(Dataset):
             else:
                 image_seg_annotations = []
 
-            labels = self.load_valid_labels(image_id, image_seg_annotations)
             img_path = image_name if adjust_path else images_path / image_name
             if sort_image:
                 with Image.open(img_path) as img:
@@ -206,13 +205,78 @@ class SpeedPlusDataset(YoloDataset):
         self.batch_size = data_cfg.batch_size
         self.dynamic_shape = getattr(data_cfg, "dynamic_shape", False)
         self.base_size = mean(self.image_size)
+        self.num_keypts = 11
+        if 'style' in data_cfg:
+            self.style_prob = data_cfg.style
+        else:
+            self.style_prob = 0.0
 
         transforms = [eval(aug)(prob) for aug, prob in augment_cfg.items()]
         self.transform = AugmentationComposer(transforms, self.image_size, self.base_size)
         self.transform.get_more_data = self.get_more_data
-        self.img_paths, self.bboxes, self.ratios = tensorlize(self.load_data(Path(dataset_cfg.path)/folder, phase_name))
+        data = self.load_data(dataset_cfg, phase_name, folder)
+        self.image_paths, self.style_paths, self.bboxes, self.quaternion, self.translation, self.origin, self.keypoint, self.rotation = self.tensorlize(data)
 
-    def filter_data(self, dataset_path: Path, phase_name: str, sort_image: bool = False) -> list:
+    def tensorlize(self, data):
+        try:
+            image_paths, style_paths, bboxes, quaternion, translation, origin, keypoints, rotation = zip(*data)
+        except ValueError as e:
+            logger.error(
+                ":rotating_light: This may be caused by using old cache or another version of YOLO's cache.\n"
+                ":rotating_light: Please clean the cache and try running again."
+            )
+            raise e
+        max_box = max(bbox.size(0) for bbox in bboxes)
+        padded_bbox_list = []
+        for bbox in bboxes:
+            padding = torch.full((max_box, 5), -1, dtype=torch.float32)
+            padding[: bbox.size(0)] = bbox
+            padded_bbox_list.append(padding)
+        bboxes = np.stack(padded_bbox_list)
+        image_paths = np.array(image_paths)
+        style_paths = np.array(style_paths)
+        quaternion = np.array(quaternion)
+        translation = np.array(translation)
+        origin = np.array(origin)
+        keypoints = np.array(keypoints)
+        rotation = np.array(rotation)
+        return image_paths, style_paths, bboxes, quaternion, translation, origin, keypoints, rotation
+ 
+
+    def load_data(self, dataset_cfg: DatasetConfig, phase_name: str, folder: str):
+        """
+        Loads data from a cache or generates a new cache for a specific dataset phase.
+
+        Parameters:
+            dataset_path (Path): The root path to the dataset directory.
+            phase_name (str): The specific phase of the dataset (e.g., 'train', 'test') to load or generate data for.
+
+        Returns:
+            dict: The loaded data from the cache for the specified phase.
+        """
+        dataset_path = Path(dataset_cfg.path) / folder
+        cache_path = dataset_path / f"{phase_name}.cache"
+
+        if not cache_path.exists():
+            logger.info(f":factory: Generating {phase_name} cache")
+            data = self.filter_data(dataset_cfg, phase_name, folder, self.dynamic_shape)
+            torch.save(data, cache_path)
+        else:
+            try:
+                data = torch.load(cache_path, weights_only=False)
+            except Exception as e:
+                logger.error(
+                    f":rotating_light: Failed to load the cache at '{cache_path}'.\n"
+                    ":rotating_light: This may be caused by using cache from different other YOLO.\n"
+                    ":rotating_light: Please clean the cache and try running again."
+                )
+                raise e
+            logger.info(f":package: Loaded {phase_name} cache, there are {len(data)} data in total.")
+        return data
+
+       
+
+    def filter_data(self, dataset_cfg: DatasetConfig, phase_name: str, folder: str, sort_image: bool = False) -> list:
         """
         Filters and collects dataset information by pairing images with their corresponding labels.
 
@@ -224,7 +288,13 @@ class SpeedPlusDataset(YoloDataset):
         Returns:
             list: A list of tuples, each containing the path to an image file and its associated segmentation as a tensor.
         """
-        images_path = dataset_path / "images_768x512_RGB" 
+        dataset_path = Path(dataset_cfg.path) / folder
+        
+        images_path = dataset_path / dataset_cfg.images
+        if 'styles' in dataset_cfg:
+            styles_path = dataset_path / dataset_cfg.styles
+        else:
+            styles_path = Path('')
         json_path = dataset_path / f"{phase_name}.json"
         labels_path = dataset_path / "labels" / f"{phase_name}.csv"
         if not json_path.exists():
@@ -246,22 +316,124 @@ class SpeedPlusDataset(YoloDataset):
         data = []
         valid_inputs = 0
         for idx, label in enumerate(labels_data):  #enumerate(track(images_list, description="Filtering data")):
+            # 0 image
+            # 1:5 boundingbox
+            # 5:9 quaternion
+            # 9:12 translation
+            # 12:14 origin
+            # 14: keypoints
+            # rotationmatrix = quat2dcm(quaternion)
+
+            # Bounding box (xmin, ymin, xmax, ymax) (normalized)
+            bbox = np.array(label[1:5], dtype=np.float32)
+
+            # Clip box within image
+            bbox[[0,2]] = np.clip(bbox[[0,2]], 0, 1)
+            bbox[[1,3]] = np.clip(bbox[[1,3]], 0, 1)
+
+            # Target origin [2,]
+            origin = np.array(label[12:14], dtype=np.float32)
+            origin = np.reshape(origin, (2,))
+
+            # Keypoints (normalized) [N, 2]
+            keypoints = np.array(label[14:], dtype=np.float32)
+            keypoints = np.reshape(keypoints, (self.num_keypts, 2)) # (N, 2)
+
+            # Ground-truth pose
+            quaternion = np.array(label[5:9],  dtype=np.float32) # [qw, qx, qy, qz]
+            translation = np.array(label[9:12], dtype=np.float32)
+
+            # Rotation matrix
+            rotation = quat2dcm(quaternion)
+
             image_name = label[0]
             image_id = Path(image_name).stem
-
             image_seg_annotations = [[0]+label[1:5]]    # eventually add the other elements
-
             labels = self.load_valid_labels(image_id, image_seg_annotations)
-            img_path = images_path / image_name
-            data.append((img_path, labels, 0))
-            if len(image_seg_annotations) != 0:
-                valid_inputs += 1
+            image_path = images_path / image_name
+            if not image_path.is_file():
+                image_name = Path(image_name).with_suffix('.png')
+                image_path = images_path / image_name
+            if not image_path.is_file():
+                continue
+            style_path = styles_path / image_name
+
+            image_id = Path(image_name).stem
+            labels = self.load_valid_labels(image_id, image_seg_annotations)
+            #data.append((img_path, labels, 0, pose_data))
+            data.append((image_path, style_path, labels, quaternion, translation, origin, keypoints, rotation))
+            valid_inputs += 1
 
         #data = sorted(data, key=lambda x: x[2], reverse=True)
 
         logger.info(f"Recorded {valid_inputs}/{len(images_list)} valid inputs")
         return data
 
+
+    def get_data(self, idx):
+        if torch.rand(1) < self.style_prob:
+            img_path = self.style_paths[idx]
+        else:
+            img_path = self.image_paths[idx]
+        bboxes = self.bboxes[idx]
+        valid_mask = bboxes[:, 0] != -1
+        with Image.open(img_path) as img:
+            img = img.convert("RGB")
+        return img, torch.from_numpy(bboxes[valid_mask]), img_path
+
+
+    def __getitem__(self, idx):
+        img, bboxes, img_path = self.get_data(idx)
+
+        targets = {'bboxes':    bboxes,
+                   'quaternion':     torch.from_numpy(self.quaternion[idx]),
+                   'rotationmatrix': torch.from_numpy(self.rotation[idx]),
+                   'translation':    torch.from_numpy(self.translation[idx])}
+
+        img, targets, rev_tensor = self.transform(img, targets)
+        targets['bboxes'][:, [1, 3]] *= self.image_size[0]
+        targets['bboxes'][:, [2, 4]] *= self.image_size[1]
+
+        return img, targets, rev_tensor, img_path
+
+    def _load_annotations(self, label):
+        """ Load labels into a dictionary """
+
+        # 5:9 quaternion
+        # 9:12 translation
+        # 12:14 origin
+        # 14: keypoints
+        # rotationmatrix = quat2dcm(quaternion)
+
+        # Bounding box (xmin, ymin, xmax, ymax) (normalized)
+        bbox = np.array(label[1:5], dtype=np.float32)
+
+        # Clip box within image
+        bbox[[0,2]] = np.clip(bbox[[0,2]], 0, 1)
+        bbox[[1,3]] = np.clip(bbox[[1,3]], 0, 1)
+
+        # Target origin [2,]
+        origin = np.array(label[12:14], dtype=np.float32)
+        origin = np.reshape(origin, (2,))
+
+        # Keypoints (normalized) [N, 2]
+        keypts = np.array(label[14:], dtype=np.float32)
+        keypts = np.reshape(keypts, (self.num_keypts, 2)) # (N, 2)
+
+        # Ground-truth pose
+        q_gt = np.array(label[5:9],  dtype=np.float32) # [qw, qx, qy, qz]
+        t_gt = np.array(label[9:12], dtype=np.float32)
+
+        annotations = {'imgpath': label[0], # Image file name, e.g., 'img000001.jpg'
+                       #'domain': self.domain,              # Image domain, e.g., 'lightbox' of SPEED+
+                       'boundingbox': bbox,
+                       'origin': origin,
+                       'keypoints': keypts,
+                       'quaternion': q_gt,
+                       'rotationmatrix': quat2dcm(q_gt),   # 3x3 rotation matrix of ground-truth orientation
+                       'translation': t_gt}
+
+        return annotations
 
 
 def collate_fn(batch: List[Tuple[Tensor, Tensor]]) -> Tuple[Tensor, List[Tensor]]:
@@ -294,6 +466,26 @@ def collate_fn(batch: List[Tuple[Tensor, Tensor]]) -> Tuple[Tensor, List[Tensor]
     return batch_size, batch_images, batch_targets, batch_reverse, batch_path
 
 
+def speed_collate_fn(batch):
+    batch_size = len(batch)
+    batch_images, batch_targets, batch_reverse, batch_path = zip(*batch)
+    batch_images = torch.stack(batch_images)
+    batch_reverse = torch.stack(batch_reverse)
+    #print(type(batch_targets))
+    #for n,x in enumerate(batch_targets):
+    #    print('type(batch_targets[{}]): {}'.format(n,type(x)))
+    #return  batch_size, batch_images, batch_targets, batch_reverse, batch_path
+
+    # Extract keys safely from the first sample
+    keys = batch_targets[0].keys()
+    collated_targets = {}
+    for key in keys:
+        items = [sample[key] for sample in batch_targets]
+        collated_targets[key] = torch.stack(items, dim=0)
+            
+    return  batch_size, batch_images, collated_targets, batch_reverse, batch_path
+
+
 def create_dataloader(data_cfg: DataConfig, dataset_cfg: DatasetConfig, task: str = "train"):
     if task == "inference":
         return StreamDataLoader(data_cfg)
@@ -310,7 +502,7 @@ def create_dataloader(data_cfg: DataConfig, dataset_cfg: DatasetConfig, task: st
                     batch_size=data_cfg.batch_size,
                     num_workers=data_cfg.cpu_num,
                     pin_memory=data_cfg.pin_memory,
-                    collate_fn=collate_fn,
+                    collate_fn=speed_collate_fn,
                 ))
             return data_loaders
         else:
@@ -320,7 +512,7 @@ def create_dataloader(data_cfg: DataConfig, dataset_cfg: DatasetConfig, task: st
                 batch_size=data_cfg.batch_size,
                 num_workers=data_cfg.cpu_num, #MCHP set to 0 to debug
                 pin_memory=data_cfg.pin_memory,
-                collate_fn=collate_fn,
+                collate_fn=speed_collate_fn,
             )
             
 
@@ -431,3 +623,30 @@ class StreamDataLoader:
 
     def __len__(self):
         return self.queue.qsize() if not self.is_stream else 0
+
+def quat2dcm(q):
+    """ Computing direction cosine matrix from quaternion, adapted from PyNav. """
+    # normalizing quaternion
+    q = q/np.linalg.norm(q)
+
+    q0 = q[0]
+    q1 = q[1]
+    q2 = q[2]
+    q3 = q[3]
+
+    dcm = np.zeros((3, 3), dtype=np.float32)
+
+    dcm[0, 0] = 2 * q0 ** 2 - 1 + 2 * q1 ** 2
+    dcm[1, 1] = 2 * q0 ** 2 - 1 + 2 * q2 ** 2
+    dcm[2, 2] = 2 * q0 ** 2 - 1 + 2 * q3 ** 2
+
+    dcm[0, 1] = 2 * q1 * q2 + 2 * q0 * q3
+    dcm[0, 2] = 2 * q1 * q3 - 2 * q0 * q2
+
+    dcm[1, 0] = 2 * q1 * q2 - 2 * q0 * q3
+    dcm[1, 2] = 2 * q2 * q3 + 2 * q0 * q1
+
+    dcm[2, 0] = 2 * q1 * q3 + 2 * q0 * q2
+    dcm[2, 1] = 2 * q2 * q3 - 2 * q0 * q1
+
+    return dcm

@@ -13,6 +13,8 @@ from torch import Tensor, no_grad
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR, SequentialLR, _LRScheduler
 
+import numpy as np
+
 from yolo.config.config import (
     IDX_TO_ID,
     DataConfig,
@@ -21,7 +23,7 @@ from yolo.config.config import (
     SchedulerConfig,
 )
 from yolo.model.yolo import YOLO
-from yolo.utils.bounding_box_utils import Anc2Box, Vec2Box, bbox_nms, transform_bbox
+from yolo.utils.bounding_box_utils import Anc2Box, Vec2Box, bbox_nms, transform_bbox, bbox_sp_nms, rot_6d_to_matrix
 from yolo.utils.logger import logger
 
 
@@ -222,6 +224,139 @@ class PostProcess:
             pred_bbox = (pred_bbox - rev_tensor[:, None, 1:]) / rev_tensor[:, 0:1, None]
         pred_bbox = bbox_nms(pred_class, pred_bbox, self.nms, pred_conf)
         return pred_bbox
+
+
+class PostProcessSpacecraftPose:
+    """
+    TODO: function document
+    scale back the prediction and do nms for pred_bbox
+    """
+
+    def __init__(self, converter: Union[Vec2Box, Anc2Box], nms_cfg: NMSConfig) -> None:
+        self.converter = converter
+        self.nms = nms_cfg
+
+    def __call__(
+        self, predict, rev_tensor: Optional[Tensor] = None, image_size: Optional[List[int]] = None
+    ) -> List[Tensor]:
+        if image_size is not None:
+            self.converter.update(image_size)
+        prediction = self.converter(predict["Main"])
+        pred_class, _, pred_bbox, pred_trans, pred_rot = prediction
+        pred_conf = None
+        if rev_tensor is not None:
+            assert(0) # MCHP what is rev_tensor?
+            pred_bbox = (pred_bbox - rev_tensor[:, None, 1:]) / rev_tensor[:, 0:1, None]
+        pred_bbox, pred_trans, pred_rot = bbox_sp_nms(pred_class, pred_bbox, pred_trans, pred_rot, self.nms, pred_conf)
+        return pred_bbox, pred_trans, pred_rot
+
+
+class SpacecraftPoseMetric:
+    def __init__(self, domain, spacecraft_cfg):
+        metric_names = ['effi_eR', 'effi_eT', 'effi_eR_HIL', 'effi_eT_norm_HIL', 'effi_pose']
+        self.metrics = {}
+        self.domain = domain
+        self.SPEED_THRESHOLD_Q = spacecraft_cfg.SPEED_THRESHOLD_Q
+        self.SPEED_THRESHOLD_T = spacecraft_cfg.SPEED_THRESHOLD_T
+        for name in metric_names:
+            self.metrics[name] = [] 
+
+    def update(self, predicts, predicts_trans, predicts_rot, targets):
+        R_reg = []
+        t_reg = []
+        B = len(predicts)
+        #if len(predicts_trans)!=B or len(predicts_rot)!=B or len(targets)!=B:
+        #    print('SpacecraftPoseMetric warning: predicts batch sizes are different')
+        for b in range(len(predicts)):
+            if predicts[b].numel()==0:
+                continue
+            ind = torch.argmax(predicts[b][:,5])
+            R_pr    = rot_6d_to_matrix(predicts_rot[b][ind,:].to(torch.float32)).cpu().numpy()
+            t_pr    = predicts_trans[b][ind,:].to(torch.float32).cpu().numpy()
+            R_gt    = targets['rotationmatrix'][b,:,:].to(torch.float32).cpu().numpy()
+            t_gt    = targets['translation'][b,:].to(torch.float32).cpu().numpy()
+
+            # Pose metric(s)
+            err_q = error_orientation(R_pr, R_gt, 'rotationmatrix') # [deg]
+            err_t = error_translation(t_pr, t_gt)
+            speed_t, speed_q, speed = speed_score(t_pr, R_pr, t_gt, R_gt,
+                representation='rotationmatrix',
+                applyThreshold=self.domain in ['lightbox', 'sunlamp'],
+                theta_q=self.SPEED_THRESHOLD_Q,
+                theta_t=self.SPEED_THRESHOLD_T)
+
+            # Save & record
+            R_reg.append(R_pr)
+            t_reg.append(t_pr)
+            result = {'_eR': err_q, '_eT': err_t, '_eR_HIL': speed_q, '_eT_norm_HIL': speed_t, '_pose': speed}
+            for m, v in result.items():
+                self.metrics['effi'+m].append(v)
+
+    def compute(self) -> dict:
+        results = {'pose':np.mean(self.metrics['effi_pose']),
+                   'pose_t':np.mean(self.metrics['effi_eT_norm_HIL']),
+                   'pose_r':np.mean(self.metrics['effi_eR_HIL']),}
+        return results
+
+    def reset(self):
+       for k in self.metrics.keys():
+            self.metrics[k] = [] 
+
+def error_translation(t_pr, t_gt):
+    t_pr = np.reshape(t_pr, (3,))
+    t_gt = np.reshape(t_gt, (3,))
+
+    return np.sqrt(np.sum(np.square(t_gt - t_pr)))
+
+def _error_orientation_quaternion(q_pr, q_gt):
+    # q must be [qvec, qcos]
+    q_pr = np.reshape(q_pr, (4,))
+    q_gt = np.reshape(q_gt, (4,))
+
+    qdot = np.abs(np.dot(q_pr, q_gt))
+    qdot = np.minimum(qdot, 1.0)
+    return np.rad2deg(2*np.arccos(qdot)) # [deg]
+
+def _error_orientation_rotationmatrix(R_pr, R_gt):
+    assert R_pr.shape == R_gt.shape and R_pr.ndim == 2
+    assert np.abs(np.linalg.det(R_pr) - 1) < 1e-6, \
+        f'Determinant of R_pr is {np.linalg.det(R_pr)}'
+
+    Rdot = np.dot(R_pr, np.transpose(R_gt))
+    trace = (np.trace(Rdot) - 1.0)/2.0
+    trace = np.clip(trace, -1.0, 1.0)
+    return np.rad2deg(np.arccos(trace))
+
+def error_orientation(ori_pr, ori_gt, representation='quaternion'):
+    assert representation in ['quaternion', 'rotationmatrix'], \
+        'Orientation representation must be either quaternion or rotationmatrix'
+
+    if representation == 'quaternion':
+        return _error_orientation_quaternion(ori_pr, ori_gt)
+    else:
+        return _error_orientation_rotationmatrix(ori_pr, ori_gt)
+
+def speed_score(t_pr, ori_pr, t_gt, ori_gt, representation='quaternion',
+                    applyThreshold=True, theta_q=0.5, theta_t=0.005):
+    # theta_q: rotation threshold [deg]
+    # theta_t: normalized translation threshold [m/m]
+    err_t = error_translation(t_pr, t_gt)
+    err_q = error_orientation(ori_pr, ori_gt, representation) # [deg]
+
+    t_gt = np.reshape(t_gt, (3,))
+    speed_t = err_t / np.sqrt(np.sum(np.square(t_gt)))
+    speed_q = np.deg2rad(err_q)
+
+    # Check if within threshold
+    if applyThreshold and err_q < theta_q:
+        speed_q = 0.0
+
+    if applyThreshold and speed_t < theta_t:
+        speed_t = 0.0
+
+    speed = speed_t + speed_q
+
+    return speed_t, speed_q, speed
 
 
 def collect_prediction(predict_json: List, local_rank: int) -> List:

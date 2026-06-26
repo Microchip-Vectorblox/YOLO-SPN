@@ -1,0 +1,11 @@
+path: /scratch/sjc-advdev01/ml/datasets/speedplusv2
+train_folder: spin
+val_folder: ['spin','lightbox','sunlamp']
+images: images_768x512_GRAY
+#styles: styles_768x512_RGB
+camera: 'camera.json'
+keypoints: 'models/tangoPoints.mat'             # .mat file containing [3 x N] keypoints (m)
+cadmodel: 'models/tango.ply'                    # .ply file containing target 3D model
+class_num: 1
+class_list: ['Spacecraft']
+
