@@ -4,6 +4,7 @@ val_folder: lightbox
 camera: 'camera.json'
 keypoints: 'models/tangoPoints.mat'             # .mat file containing [3 x N] keypoints (m)
 cadmodel: 'models/tango.ply'                    # .ply file containing target 3D model
+num_keypoints: 11
 class_num: 1
 class_list: ['Spacecraft']
 

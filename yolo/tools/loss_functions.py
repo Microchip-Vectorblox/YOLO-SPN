@@ -115,6 +115,7 @@ class YOLOSPLoss:
         self.dfl = DFLoss(vec2box, reg_max)
         self.iou = BoxLoss()
         self.sp = SPLoss()
+        self.heat = HeatLoss()
 
         self.matcher = BoxMatcher(loss_cfg.matcher, self.class_num, vec2box, reg_max)
 
@@ -127,7 +128,7 @@ class YOLOSPLoss:
         return anchors_cls, anchors_box
 
     def __call__(self, predicts: List[Tensor], targets: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
-        predicts_cls, predicts_anc, predicts_box, predicts_trans, predicts_rot = predicts
+        predicts_cls, predicts_anc, predicts_box, predicts_trans, predicts_rot, predicts_heat = predicts
         # For each predicted targets, assign a best suitable ground truth box.
         align_targets, valid_masks = self.matcher(targets['bboxes'], (predicts_cls.detach(), predicts_box.detach()))
 
@@ -144,19 +145,25 @@ class YOLOSPLoss:
         ## -- DFL -- ##
         loss_dfl = self.dfl(predicts_anc, targets_bbox, valid_masks, box_norm, cls_norm)
         ## -- SP  -- ##
-        #anchor_states = compute_anchor_state(self.anchors, targets['bboxes'])
-        N = predicts_rot.shape[1]
-        targets_rot = targets['rotationmatrix'].unsqueeze(1).expand(-1,N,-1,-1)
-        targets_trans = targets['translation'].unsqueeze(1).expand(-1,N,-1)
         loss_pos,loss_rot = self.sp(predicts_rot, predicts_trans, targets['rotationmatrix'], targets['translation'], valid_masks)
-        #loss_pose = self.pose(rotation_raw_6d,
-        #                      translation,
-        #                      targets['rotationmatrix'],
-        #                      targets['translation'],
-        #                      anchor_states)
+        ## -- Heat -- ##
+        loss_heat = self.heat(predicts_heat, targets['heatmap'])
 
-        return loss_iou, loss_dfl, loss_cls, loss_pos, loss_rot
+        return loss_iou, loss_dfl, loss_cls, loss_pos, loss_rot, loss_heat
 
+
+class HeatLoss(nn.Module):
+    def __init__(self):
+        super(HeatLoss, self).__init__()
+
+    def forward(self, x, y):
+        assert x.size() == y.size()
+
+        # MSE loss for heatmaps
+        loss = torch.square(x - y)
+        loss = loss.sum(dim=(2,3)).mean(dim=1).mean()
+
+        return loss
 
 
 class SPLoss(nn.Module):
@@ -303,23 +310,25 @@ class DualLossSpacecraftPose:
         self.cls_rate = loss_cfg.objective["BCELoss"]
         self.pos_rate = loss_cfg.objective["SPPosLoss"]
         self.rot_rate = loss_cfg.objective["SPRotLoss"]
+        self.heat_rate = loss_cfg.objective["HeatLoss"]
 
     def __call__(
         self, aux_predicts: List[Tensor], main_predicts: List[Tensor], targets: Tensor
     ) -> Tuple[Tensor, Dict[str, float]]:
         # TODO: Need Refactor this region, make it flexible!
-        aux_iou, aux_dfl, aux_cls, aux_pos, aux_rot = self.loss(aux_predicts, targets)
-        main_iou, main_dfl, main_cls, main_pos, main_rot = self.loss(main_predicts, targets)
+        aux_iou, aux_dfl, aux_cls, aux_pos, aux_rot, aux_heat = self.loss(aux_predicts, targets)
+        main_iou, main_dfl, main_cls, main_pos, main_rot, main_heat = self.loss(main_predicts, targets)
 
         total_loss = [
             self.iou_rate * (aux_iou * self.aux_rate + main_iou),
             self.dfl_rate * (aux_dfl * self.aux_rate + main_dfl),
             self.cls_rate * (aux_cls * self.aux_rate + main_cls),
-            self.pos_rate  * (aux_pos  * self.aux_rate + main_pos),
-            self.rot_rate  * (aux_rot  * self.aux_rate + main_rot),
+            self.pos_rate  * (aux_pos * self.aux_rate + main_pos),
+            self.rot_rate  * (aux_rot * self.aux_rate + main_rot),
+            self.heat_rate  * (aux_heat * self.aux_rate + main_heat),
         ]
         loss_dict = {
-            f"Loss/{name}Loss": value.detach().item() for name, value in zip(["Box", "DFL", "BCE", "SPPos", "SPRot"], total_loss)
+            f"Loss/{name}Loss": value.detach().item() for name, value in zip(["Box", "DFL", "BCE", "SPPos", "SPRot","Heat"], total_loss)
         }
         return sum(total_loss), loss_dict
 

@@ -64,40 +64,66 @@ class ValidateModel(BaseModel):
     def val_dataloader(self):
         return self.val_loader
 
-    def debug_image(self, image, bp, tp, rp, bt, tt, Rt, image_path):
+    def debug_heatmap(self, predict, target):
+        import numpy as np
+        from yolo.utils.bounding_box_utils import project_keypoints
+        keypts3d_origin = np.concatenate((np.zeros((3,1), dtype=np.float32), np.transpose(self.model.keypts3d)), axis=1) # [3, 12]
+        kt = project_keypoints(target['quaternion'].cpu().numpy(), target['translation'].cpu().numpy(), self.model.camera['cameraMatrix'], self.model.camera['distCoeffs'], keypts3d_origin) # (2, 12)
+        
+        heat_err = np.sqrt(np.sum(np.square(kt[:,1:].transpose() - predict['heat_kps'][:,:2]),axis=1))
+        heat_val = predict['heat_kps'][:,2]
+
+        return heat_err, heat_val
+
+    def debug_image(self, image, predict, target, metric, image_path, output):
         import torch
         import numpy as np
         from yolo.utils.bounding_box_utils import project_keypoints, quat2dcm, rot_6d_to_matrix
         from yolo.utils.bounding_box_utils import quat2dcm
-        predict = tp is not None
-        bt = bt[0].to(torch.float32).numpy()
-        tt = tt.to(torch.float32).numpy()
-        Rt = Rt.to(torch.float32).numpy()
-        keypts3d_origin = np.concatenate((np.zeros((3,1), dtype=np.float32), np.transpose(self.model.keypts3d)), axis=1) # [3, 12]
-        kt = project_keypoints(Rt, tt, self.model.camera['cameraMatrix'], self.model.camera['distCoeffs'], keypts3d_origin) # (2, 12)
-        if predict:
-            bp = bp[0].to(torch.float32).numpy()
-            tp = tp[0].to(torch.float32).numpy()
-            Rp = rot_6d_to_matrix(rp[0].to(torch.float32)).numpy()
-            kp = project_keypoints(Rp, tp, self.model.camera['cameraMatrix'], self.model.camera['distCoeffs'], keypts3d_origin) # (2, 12)
-            kRp = project_keypoints(Rp, tt, self.model.camera['cameraMatrix'], self.model.camera['distCoeffs'], keypts3d_origin)
-            ktp = project_keypoints(Rt, tp, self.model.camera['cameraMatrix'], self.model.camera['distCoeffs'], keypts3d_origin)
-
         from torchvision.transforms.functional import to_pil_image
         from PIL import Image, ImageDraw, ImageFont
+
         img = to_pil_image(image).copy()
+        
+        keypts3d_origin = np.concatenate((np.zeros((3,1), dtype=np.float32), np.transpose(self.model.keypts3d)), axis=1) # [3, 12]
+        kt = project_keypoints(target['quaternion'].cpu().numpy(), target['translation'].cpu().numpy(), self.model.camera['cameraMatrix'], self.model.camera['distCoeffs'], keypts3d_origin) # (2, 12)
         kt[0,:] *= img.size[0]/self.model.camera['Nu']
         kt[1,:] *= img.size[1]/self.model.camera['Nv']
-        if predict:
+        if not predict==None:
+            kp = project_keypoints(predict['pose_rot'].cpu().numpy(), predict['pose_trans'].cpu().numpy(), self.model.camera['cameraMatrix'], self.model.camera['distCoeffs'], keypts3d_origin) # (2, 12)
             kp[0,:] *= img.size[0]/self.model.camera['Nu']
             kp[1,:] *= img.size[1]/self.model.camera['Nv']
-            ktp[0,:] *= img.size[0]/self.model.camera['Nu']
-            ktp[1,:] *= img.size[1]/self.model.camera['Nv']
-            kRp[0,:] *= img.size[0]/self.model.camera['Nu']
-            kRp[1,:] *= img.size[1]/self.model.camera['Nv']
-            kp_rms = np.sqrt(np.mean(np.square(kp-kt)))
-            ktp_rms = np.sqrt(np.mean(np.square(ktp-kt)))
-            kRp_rms = np.sqrt(np.mean(np.square(kRp-kt)))
+            if not predict['heat_reject']:
+                kh = project_keypoints(predict['heat_rot'], predict['heat_trans'], self.model.camera['cameraMatrix'], self.model.camera['distCoeffs'], keypts3d_origin) # (2, 12)
+                kf = project_keypoints(predict['heat_rot'], predict['pose_trans'].cpu().numpy(), self.model.camera['cameraMatrix'], self.model.camera['distCoeffs'], keypts3d_origin) # (2, 12)
+                #kp_rms = np.sqrt(np.mean(np.square(kp-kt)))
+                kh[0,:] *= img.size[0]/self.model.camera['Nu']
+                kh[1,:] *= img.size[1]/self.model.camera['Nv']
+                #kh_rms = np.sqrt(np.mean(np.square(kh-kt)))
+                kf[0,:] *= img.size[0]/self.model.camera['Nu']
+                kf[1,:] *= img.size[1]/self.model.camera['Nv']
+            heat_peaks = predict['heat_kps'].copy()
+            heat_peaks[:,0] *= img.size[0]/self.model.camera['Nu']
+            heat_peaks[:,1] *= img.size[1]/self.model.camera['Nv']
+            heat_peaks_err = np.sqrt(np.sum(np.square(kt[:,1:].transpose() - heat_peaks[:,:2]),axis=1))
+
+        # heatmap debugging
+        #from yolo.utils.model_utils import solve_pose_from_heatmaps
+        #heatmain = torch.zeros((11,64,96))
+        #for n in range(11):
+        #    heatmain[n,int(kt[1,n+1]/8),int(kt[0,n+1]/8)] = 1.0
+        #keypts_pr, q_pr, t_pr, reject = solve_pose_from_heatmaps(output['MainHeat'][0].cpu(), (1920,1200), 0.5, self.model.camera, self.model.keypts3d)
+        #keypts_pri, q_pri, t_pri, rejecti = solve_pose_from_heatmaps(heatmain, (1920,1200), 0.5, self.model.camera, self.model.keypts3d)
+        #scale = np.tile(np.array(img.size) / [self.model.camera['Nu'],self.model.camera['Nv']],(11,1))
+        #keypts_pr = np.transpose(keypts_pr * scale)
+        #kh2 = project_keypoints(q_pr, t_pr, self.model.camera['cameraMatrix'], self.model.camera['distCoeffs'], keypts3d_origin) # (2, 12)
+        #kh2[0,:] *= img.size[0]/self.model.camera['Nu']
+        #kh2[1,:] *= img.size[1]/self.model.camera['Nv']
+        #khi = project_keypoints(q_pri, t_pri, self.model.camera['cameraMatrix'], self.model.camera['distCoeffs'], keypts3d_origin) # (2, 12)
+        #khi[0,:] *= img.size[0]/self.model.camera['Nu']
+        #khi[1,:] *= img.size[1]/self.model.camera['Nv']
+        #predict['heat_rot'] == q_pr
+        #predict['heat_trans'] == t_pr
 
         label_size = img.size[1] / 30
         draw = ImageDraw.Draw(img, "RGBA")
@@ -110,56 +136,123 @@ class ValidateModel(BaseModel):
             draw.line(line, fill="forestgreen", width=1)
         for n in range(kt.shape[1]):
             draw.text(kt[:,n], str(n), fill="lightgreen", font=font)
-        if predict:
+        if not predict==None:
             for n in range(kp.shape[1]):
                 draw.circle(kp[:,n],3,fill="red")
             for nc in connections:
                 line = (kp[0,nc[0]],kp[1,nc[0]],kp[0,nc[1]],kp[1,nc[1]])
                 draw.line(line, fill="red", width=1)
-            for n in range(kp.shape[1]):
-                draw.text(kt[:,n], str(n), fill="lightgreen", font=font)
-            draw.text((0,0),f"keypoint err: {kp_rms:.2f} (pix rms)", fill="white", font=font)
-            draw.text((0,30),f"  translation: {ktp_rms:.2f}", fill="white", font=font)
-            draw.text((0,60),f"  rotation: {kRp_rms:.2f}", fill="white", font=font)
-    
+            if not predict['heat_reject']:
+                for n in range(kh.shape[1]):
+                    draw.circle(kh[:,n],3,fill="yellow")
+                for nc in connections:
+                    line = (kh[0,nc[0]],kh[1,nc[0]],kh[0,nc[1]],kh[1,nc[1]])
+                    draw.line(line, fill="yellow", width=1)
+            draw.text((0,0),f"pose: {metric['effi_eR']:.4f}, {metric['effi_eT']:.4f} (deg,m?)", fill="red", font=font)
+            draw.text((0,30),f"pose: {metric['effi_eR_HIL']:.4f}, {metric['effi_eT_norm_HIL']:.4f}, {metric['effi_pose']:.4f} (rot,trans,final)", fill="red", font=font)
+            if not predict['heat_reject']:
+                draw.text((0,60),f"heat: {metric['heat_eR']:.4f}, {metric['heat_eT']:.4f} (deg,m?)", fill="yellow", font=font)
+                draw.text((0,90),f"heat: {metric['heat_eR_HIL']:.4f}, {metric['heat_eT_norm_HIL']:.4f}, {metric['heat_pose']:.4f} (rot,trans,final)", fill="yellow", font=font)
+            # heatmap peaks
+            for n in range(heat_peaks.shape[0]):
+                if heat_peaks[n,3]:
+                    draw.circle(heat_peaks[n,:],3,fill="blue")
+                    draw.text(heat_peaks[n,:], str(n+1), fill="blue", font=font)
+            #for n in range(khi.shape[1]):
+            #    draw.circle(khi[:,n],3,fill="yellow")
+            #for nc in connections:
+            #    line = (khi[0,nc[0]],khi[1,nc[0]],khi[0,nc[1]],khi[1,nc[1]])
+            #    draw.line(line, fill="yellow", width=1)
+            #for n in range(keypts_pr.shape[0]):
+            #    draw.circle(keypts_pr[n,:],3,fill="blue")
+            #    draw.text(keypts_pr[n,:], str(n+1), fill="blue", font=font)
+
         save_name = image_path.with_suffix(".png").name
         img.save(save_name)
         print('saved debug image: '+save_name)
+
+        if 0:
+            heatmapTarget = torch.zeros_like(target['heatmap'])
+            x = torch.arange(96).reshape((1,96))
+            y = torch.arange(64).reshape((64,1))
+            sigma = 2.0
+            for h in range(11):
+                x0 = kt[0,h+1]/8
+                y0 = kt[1,h+1]/8
+                g = torch.exp(-(torch.tile((x-x0)**2,(64,1)) + torch.tile((y-y0)**2,(1,96)))/(2*sigma**2))
+                heatmapTarget[h] = g
+
+            from yolo.utils.model_utils import solve_pose_from_heatmaps
+            keypts_ht, q_ht, t_ht, reject_ht = solve_pose_from_heatmaps(heatmapTarget.cpu(), (1920,1200), 0.5, self.model.camera, self.model.keypts3d)
+            keypts_ht[:,0] *= 768/self.model.camera['Nu']
+            keypts_ht[:,1] *= 512/self.model.camera['Nv']
+            kg = keypts_ht[:,:2].transpose()
+            kht = project_keypoints(q_ht, t_ht, self.model.camera['cameraMatrix'], self.model.camera['distCoeffs'], keypts3d_origin) # (2, 12)
+            kht[0,:] *= 768/self.model.camera['Nu']
+            kht[1,:] *= 512/self.model.camera['Nv']
+
+            # h = 0
+            img = to_pil_image(target['heatmap'][0:3]).copy()
+            img.save('img000014_ht012.png')
+            
+            img = to_pil_image(heatmapTarget[0:3]).copy()
+            img.save('img000014_hg012.png')
+
+            img = to_pil_image(output['MainHeat'][0,h:3].clip(0,1)).copy()
+            img.save('img000014_hp012.png')
 
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         batch_size, images, targets, rev_tensor, img_paths = batch
         H, W = images.shape[2:]
         if self.spacecraft_pose:
-            predicts, predicts_trans, predicts_rot = self.post_process(self.ema(images), image_size=[W, H])
-            self.sp_metric[dataloader_idx].update(predicts, predicts_trans, predicts_rot, targets)
-            if self.debug: # testing
-                self.debug_image(images[0],predicts[0],predicts_trans[0],predicts_rot[0],targets['bboxes'][0],targets['translation'][0],targets['rotationmatrix'][0],img_paths[0])
+            predicts = self.post_process(self.ema(images), image_size=[W, H])
+            batch_metrics = self.sp_metric[dataloader_idx].update(predicts, targets)
+            if self.debug:
+                import torch
+                import numpy as np
+                peak_err = np.array([])
+                peak_val = np.array([])
+                for n in range(batch_size):
+                    #metric = {}
+                    #for k,v in self.sp_metric[dataloader_idx].metrics.items():
+                        #metric[k] = v[n-batch_size]
+                    predict = {}
+                    for k,v in predicts.items():
+                        predict[k] = v[n]
+                    target = {}
+                    for k,v in targets.items():
+                        target[k] = v[n]
+                    output = self.ema(images[n:n+1])
+                    err,val = self.debug_heatmap(predict, target)
+                    peak_err = np.concat((peak_err,err))
+                    peak_val = np.concat((peak_val,val))
+                    self.debug_image(images[n],predict,target,batch_metrics[n],img_paths[n],output)
         else:
             predicts = self.post_process(self.ema(images), image_size=[W, H])
         mAP = self.metric[dataloader_idx](
-            [to_metrics_format(predict) for predict in predicts], [to_metrics_format(target) for target in targets['bboxes']]
+            [to_metrics_format(bbox.unsqueeze(0)) for bbox in predicts['bbox']], [to_metrics_format(bboxes) for bboxes in targets['bboxes']]
         )
         return predicts, mAP
 
     def on_validation_epoch_end(self):
         for n,label in enumerate(self.val_label):
             epoch_metrics = self.metric[n].compute()
-            if self.spacecraft_pose:
-                epoch_metrics = epoch_metrics | self.sp_metric[n].compute()
             del epoch_metrics["classes"]
             if n==0:
                 self.log_dict(epoch_metrics, prog_bar=True, sync_dist=True, rank_zero_only=True)
             self.log_dict(
-                {"val/"+label+"@.5:.95": epoch_metrics["map"], "val/"+label+"@.5": epoch_metrics["map_50"]},
+                {"val_"+label+"/mAP@.5:.95": epoch_metrics["map"], "val_"+label+"/mAP@.5": epoch_metrics["map_50"]},
                 sync_dist=True,
                 rank_zero_only=True,
             )
             self.metric[n].reset()
             if self.spacecraft_pose:
-                self.log_dict({"val/"+label+" pose": epoch_metrics["pose"],
-                               "val/"+label+" pose_t": epoch_metrics["pose_t"],
-                               "val/"+label+" pose_r": epoch_metrics["pose_r"]}, sync_dist=True, rank_zero_only=True)
+                epoch_sp_metrics = self.sp_metric[n].compute()
+                epoch_log = {}
+                for k,v in epoch_sp_metrics.items():
+                    epoch_log["val_"+label+"/"+k] = v
+                self.log_dict(epoch_log, sync_dist=True, rank_zero_only=True)
                 self.sp_metric[n].reset()
 
 
@@ -188,8 +281,8 @@ class TrainModel(ValidateModel):
         lr_dict = self.trainer.optimizers[0].next_batch()
         batch_size, images, targets, *_ = batch
         predicts = self(images)
-        aux_predicts = self.vec2box(predicts["AUX"])
-        main_predicts = self.vec2box(predicts["Main"])
+        aux_predicts = self.vec2box(predicts["AUX"]) + (predicts["AUXHeat"],)
+        main_predicts = self.vec2box(predicts["Main"]) + (predicts["MainHeat"],)
         loss, loss_item = self.loss_fn(aux_predicts, main_predicts, targets)
         self.log_dict(
             loss_item,
@@ -200,7 +293,12 @@ class TrainModel(ValidateModel):
         )
         self.log_dict(lr_dict, prog_bar=False, logger=True, on_epoch=False, rank_zero_only=True)
         if self.debug:
-            self.debug_image(images[0],None,None,None,targets['bboxes'][0],targets['translation'][0],targets['rotationmatrix'][0],batch[-1][0])
+            for n in range(batch_size):
+                target = {}
+                for k,v in targets.items():
+                    target[k] = v[n]
+                self.debug_image(images[n],None,target,None,batch[-1][n],None)
+            #self.debug_image(images[0],None,None,None,targets['bboxes'][0],targets['translation'][0],targets['rotationmatrix'][0],None,None,batch[-1][0])
         return loss * batch_size
 
     def configure_optimizers(self):

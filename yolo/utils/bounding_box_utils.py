@@ -352,6 +352,8 @@ class Vec2Box:
         self.image_size = image_size
         self.anchor_grid, self.scaler = anchor_grid.to(device), scaler.to(device)
         self.cameraMatrix = model.camera['cameraMatrix']
+        self.camera = model.camera
+        self.keypts_true_3D = model.keypts3d
         self.original_size = (model.camera['Nu'],model.camera['Nv'])
 
     def create_auto_anchor(self, model: YOLO, image_size):
@@ -401,10 +403,11 @@ class Vec2Box:
             tz = preds_pose[:,:,2]
             cx = cx*(self.original_size[0]/self.image_size[0])
             cy = cy*(self.original_size[1]/self.image_size[1])
-            tx = (cx - self.cameraMatrix[0,2]) * tz / self.cameraMatrix[0,0]
-            ty = (cy - self.cameraMatrix[1,2]) * tz / self.cameraMatrix[1,1]
+            tx = (cx - self.camera['cameraMatrix'][0,2]) * tz / self.camera['cameraMatrix'][0,0]
+            ty = (cy - self.camera['cameraMatrix'][1,2]) * tz / self.camera['cameraMatrix'][1,1]
             preds_trans =  torch.stack((tx, ty, tz), dim=-1)
             preds_rot = preds_pose[:,:,3:]
+
             return preds_cls, preds_anc, preds_box, preds_trans, preds_rot
         return preds_cls, preds_anc, preds_box
 
@@ -518,28 +521,26 @@ def bbox_nms(cls_dist: Tensor, bbox: Tensor, nms_cfg: NMSConfig, confidence: Opt
 def bbox_sp_nms(cls_dist: Tensor, bbox: Tensor, trans: Tensor, rot: Tensor, nms_cfg: NMSConfig, confidence: Optional[Tensor] = None):
     cls_dist = cls_dist.sigmoid() * (1 if confidence is None else confidence)
 
-    batch_idx, valid_grid, valid_cls = torch.where(cls_dist > nms_cfg.min_confidence)
+    #batch_idx, valid_grid, valid_cls = torch.where(cls_dist > nms_cfg.min_confidence)
+    valid_grid = cls_dist.squeeze().argmax(dim=1)
+    batch_idx = torch.arange(0,valid_grid.numel()).to(bbox.device)
+    valid_cls = 0 * batch_idx
     valid_con = cls_dist[batch_idx, valid_grid, valid_cls]
     valid_box = bbox[batch_idx, valid_grid]
     valid_trans = trans[batch_idx, valid_grid]
     valid_rot = rot[batch_idx, valid_grid]
 
-    nms_idx = batched_nms(valid_box, valid_con, batch_idx + valid_cls * bbox.size(0), nms_cfg.min_iou)
+    #nms_idx = batched_nms(valid_box, valid_con, batch_idx + valid_cls * bbox.size(0), nms_cfg.min_iou)
     predicts_nms = []
     predicts_trans = []
     predicts_rot = []
     for idx in range(cls_dist.size(0)):
-        instance_idx = nms_idx[idx == batch_idx[nms_idx]]
+        predict_nms = torch.cat([valid_cls[idx:idx+1], valid_box[idx], valid_con[idx:idx+1]], dim=-1)
 
-        predict_nms = torch.cat(
-            [valid_cls[instance_idx][:, None], valid_box[instance_idx], valid_con[instance_idx][:, None]], dim=-1
-        )
-
-        predicts_nms.append(predict_nms[: nms_cfg.max_bbox])
-        predicts_trans.append(valid_trans[instance_idx[:nms_cfg.max_bbox]])
-        predicts_rot.append(valid_rot[instance_idx[:nms_cfg.max_bbox]])
+        predicts_nms.append(predict_nms)
+        predicts_trans.append(valid_trans[idx])
+        predicts_rot.append(valid_rot[idx])
     return predicts_nms, predicts_trans, predicts_rot
-
 
 
 def calculate_map(predictions, ground_truths) -> Dict[str, Tensor]:
@@ -592,8 +593,12 @@ def project_keypoints(q, r, K, dist, keypoints):
 
     if q.shape == (3,3):
         R = q   # already in matrix form
+    elif q.shape == (4,):
+        R = quat2dcm(q) # convert from quaternion
+    elif q.shape == (6,):
+        R = rot_6d_to_matrix(torch.from_numpy(q)).numpy() # convert from 6d
     else:
-        R = quat2dcm(q)
+        assert 0
 
     # Keypoints into 4 x N homogenous coordinates
     keypoints = np.vstack((keypoints, np.ones((1, keypoints.shape[1]))))

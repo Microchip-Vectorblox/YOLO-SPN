@@ -139,7 +139,7 @@ class RandomSunFlare(A.DualTransform):
     def __call__(self, image, boxes):
         if torch.rand(1) < self.prob:
             params = self.get_params_dependent_on_targets(image,boxes)
-            self.apply(image,params['src_radius'],params['flare_center_x'],params['flare_center_y'],params['circles'])
+            image = self.apply(image,params['src_radius'],params['flare_center_x'],params['flare_center_y'],params['circles'])
         return image, boxes
 
     def apply(self, image, src_radius=400, flare_center_x=0.5, flare_center_y=0.5, circles=(), **params):
@@ -155,7 +155,8 @@ class RandomSunFlare(A.DualTransform):
 
     def get_params_dependent_on_targets(self, image, boxes):
         img = np.array(image)
-        bbox = boxes[0] # Single object [xmin, ymin, xmax, ymax] (normalized)
+        
+        bbox = boxes['bboxes'][0,1:] # Single object [xmin, ymin, xmax, ymax] (normalized)
         height, width = img.shape[:2]
 
         # Flare angle
@@ -226,7 +227,7 @@ class RandomSunFlare(A.DualTransform):
 #######################
 
 class RandomBrightness:
-    def __init__(self, prob=0.5, factor_range=[0.8, 1.2]):
+    def __init__(self, prob=0.5, factor_range=[0.3, 2.0]):
         self.prob = prob
         self.factor_range = factor_range
 
@@ -238,7 +239,7 @@ class RandomBrightness:
 
 
 class RandomContrast:
-    def __init__(self, prob=0.5, factor_range=[0.8, 1.2]):
+    def __init__(self, prob=0.5, factor_range=[0.3, 2.0]):
         self.prob = prob
         self.factor_range = factor_range
 
@@ -255,7 +256,7 @@ class GaussianBlur:
 
     def __call__(self, image, boxes):
         if torch.rand(1) < self.prob:
-            kernel_size = np.random.randint(0,2)*2+3
+            kernel_size = np.random.randint(0,1)*2+3
             image = TF.gaussian_blur(image, kernel_size)
         return image, boxes
 

@@ -205,11 +205,13 @@ class SpeedPlusDataset(YoloDataset):
         self.batch_size = data_cfg.batch_size
         self.dynamic_shape = getattr(data_cfg, "dynamic_shape", False)
         self.base_size = mean(self.image_size)
-        self.num_keypts = 11
+        self.num_keypts = dataset_cfg.num_keypoints
         if 'style' in data_cfg:
             self.style_prob = data_cfg.style
         else:
             self.style_prob = 0.0
+
+        self.target_generators = HeatmapGenerator(np.array(self.image_size)//8, self.num_keypts)
 
         transforms = [eval(aug)(prob) for aug, prob in augment_cfg.items()]
         self.transform = AugmentationComposer(transforms, self.image_size, self.base_size)
@@ -274,7 +276,6 @@ class SpeedPlusDataset(YoloDataset):
             logger.info(f":package: Loaded {phase_name} cache, there are {len(data)} data in total.")
         return data
 
-       
 
     def filter_data(self, dataset_cfg: DatasetConfig, phase_name: str, folder: str, sort_image: bool = False) -> list:
         """
@@ -393,6 +394,9 @@ class SpeedPlusDataset(YoloDataset):
         img, targets, rev_tensor = self.transform(img, targets)
         targets['bboxes'][:, [1, 3]] *= self.image_size[0]
         targets['bboxes'][:, [2, 4]] *= self.image_size[1]
+
+        #targets['heatmap'] = torch.from_numpy(self.target_generators(self.keypoint[idx]))
+        targets['heatmap'] = self.target_generators(self.keypoint[idx])
 
         return img, targets, rev_tensor, img_path
 
@@ -650,3 +654,84 @@ def quat2dcm(q):
     dcm[2, 1] = 2 * q2 * q3 - 2 * q0 * q1
 
     return dcm
+
+
+class HeatmapGeneratorOld():
+    """ Adopted from the repository below:
+    https://github.com/HRNet/HigherHRNet-Human-Pose-Estimation/blob/master/lib/dataset/target_generators/target_generators.py
+    """
+    def __init__(self, output_res, num_keypts, sigma=-1):
+        self.output_res = output_res # (W, H)
+        self.num_keypts = num_keypts
+
+        if sigma < 0:
+            # sigma = self.output_res/64
+            logger.warning('Warning! Set sigma > 0 for heatmaps')
+
+        self.sigma = sigma
+        size = 6*sigma + 3
+        x = np.arange(0, size, 1, float)
+        y = x[:, np.newaxis]
+        x0, y0 = 3*sigma + 1, 3*sigma + 1
+
+        # Gaussian kernel
+        self.g = np.exp(- ((x - x0) ** 2 + (y - y0) ** 2) / (2 * sigma ** 2))
+
+    def __call__(self, keypts):
+        # keypts: [num_keypts, 2]
+        assert keypts.ndim == 2 and keypts.shape[0] == self.num_keypts, \
+                     'Keypoints must be [N x 2]'
+
+        hms = np.zeros((self.num_keypts, self.output_res[1], self.output_res[0]),
+                       dtype=np.float32)
+        sigma = self.sigma
+
+        for idx, pt in enumerate(keypts):
+            x = int(pt[0] * self.output_res[0]) # scale keypoint location
+            y = int(pt[1] * self.output_res[1])
+            if x < 0 or y < 0 or \
+                x >= self.output_res[0] or y >= self.output_res[1]:
+                continue
+
+            ul = int(np.round(x - 3 * sigma - 1)), int(np.round(y - 3 * sigma - 1))
+            br = int(np.round(x + 3 * sigma + 2)), int(np.round(y + 3 * sigma + 2))
+
+            c, d = max(0, -ul[0]), min(br[0], self.output_res[0]) - ul[0]
+            a, b = max(0, -ul[1]), min(br[1], self.output_res[1]) - ul[1]
+
+            cc, dd = max(0, ul[0]), min(br[0], self.output_res[0])
+            aa, bb = max(0, ul[1]), min(br[1], self.output_res[1])
+
+            hms[idx, aa:bb, cc:dd] = np.maximum(
+                hms[idx, aa:bb, cc:dd], self.g[a:b, c:d])
+
+        return hms
+
+class HeatmapGenerator():
+    def __init__(self, output_res, num_keypts, sigma=2.0):
+        self.output_res = output_res # (W, H)
+        self.num_keypts = num_keypts
+
+        if sigma < 0:
+            logger.warning('Warning! Set sigma > 0 for heatmaps')
+
+        W = self.output_res[0]
+        H = self.output_res[1]
+        self.sigma = sigma
+        self.x = torch.arange(W).reshape((1,W))
+        self.y = torch.arange(H).reshape((H,1))
+
+    def __call__(self, keypts):
+        # keypts: [num_keypts, 2]
+        assert keypts.ndim == 2 and keypts.shape[0] == self.num_keypts, 'Keypoints must be [N x 2]'
+
+        W = self.output_res[0]
+        H = self.output_res[1]
+        heatmapTarget = torch.zeros((self.num_keypts, H, W), dtype=torch.float32)
+        for h in range(self.num_keypts):
+            x0 = keypts[h,0]*W
+            y0 = keypts[h,1]*H
+            g = torch.exp(-(torch.tile((self.x-x0)**2,(H,1)) + torch.tile((self.y-y0)**2,(1,W)))/(2*self.sigma**2))
+            heatmapTarget[h] = g
+
+        return heatmapTarget

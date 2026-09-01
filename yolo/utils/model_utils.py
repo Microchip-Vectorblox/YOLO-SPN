@@ -14,6 +14,8 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR, SequentialLR, _LRScheduler
 
 import numpy as np
+import cv2
+from scipy.spatial.transform import Rotation as R
 
 from yolo.config.config import (
     IDX_TO_ID,
@@ -235,6 +237,7 @@ class PostProcessSpacecraftPose:
     def __init__(self, converter: Union[Vec2Box, Anc2Box], nms_cfg: NMSConfig) -> None:
         self.converter = converter
         self.nms = nms_cfg
+        self.heatmap_threshold = [0.0,0.9]    #cfg.TEST.HEATMAP_THRESHOLD
 
     def __call__(
         self, predict, rev_tensor: Optional[Tensor] = None, image_size: Optional[List[int]] = None
@@ -247,36 +250,213 @@ class PostProcessSpacecraftPose:
         if rev_tensor is not None:
             assert(0) # MCHP what is rev_tensor?
             pred_bbox = (pred_bbox - rev_tensor[:, None, 1:]) / rev_tensor[:, 0:1, None]
-        pred_bbox, pred_trans, pred_rot = bbox_sp_nms(pred_class, pred_bbox, pred_trans, pred_rot, self.nms, pred_conf)
-        return pred_bbox, pred_trans, pred_rot
+        pred_bbox, pose_trans, pose_rot = bbox_sp_nms(pred_class, pred_bbox, pred_trans, pred_rot, self.nms, pred_conf)
+
+        # heatmap stuff
+        heat_kps = []
+        heat_trans = []
+        heat_rot = []
+        heat_reject = []
+        for b in range(predict["MainHeat"].shape[0]):
+            keypts_pr, q_pr, t_pr, reject = solve_pose_from_heatmaps(
+                predict["MainHeat"][b].cpu(), #outputs[i].squeeze(0).cpu(),
+                (self.converter.camera['Nu'],self.converter.camera['Nv']),
+                self.heatmap_threshold,
+                self.converter.camera, self.converter.keypts_true_3D
+            )
+            heat_kps.append(keypts_pr)
+            heat_trans.append(t_pr)
+            heat_rot.append(q_pr)
+            heat_reject.append(reject)
+
+        predictOut = {'bbox':pred_bbox,
+                      'pose_trans':pose_trans,
+                      'pose_rot':pose_rot,
+                      'heat_trans':heat_trans,
+                      'heat_rot':heat_rot,
+                      'heat_reject':heat_reject,
+                      'heat_kps':heat_kps}
+        return predictOut
+
+
+def solve_pose_from_heatmaps_old(heatmaps, image_size, threshold, camera, keypts_true_3D):
+    # heatmaps: [Nk x H x W]
+    nK, nH, nW = heatmaps.shape
+
+    # Take max
+    maxVal, maxInd = heatmaps.view(nK, -1).max(-1)
+
+    # Flag to reject measurements
+    reject = False
+
+    # Apply heatmaps until we have enough keypoints detected
+    visibleIdx = []
+    while len(visibleIdx) < 5 and threshold >= 0:
+        visibleIdx = torch.nonzero(maxVal > threshold)
+        threshold -= 0.1
+
+    if len(visibleIdx) < 5:
+        reject = True
+        return None, None, None, reject
+    else:
+        # Extract keypoint locations in [pix]
+        keypts = torch.zeros(nK, 2)
+        for k in range(nK):
+            if k in visibleIdx:
+                y = torch.floor(maxInd[k] / nW)
+                x = maxInd[k] - nW * y
+                keypts[k,0] = x / nW * image_size[0]
+                keypts[k,1] = y / nH * image_size[1]
+
+        # PnP
+        q, t = pnp(keypts_true_3D[visibleIdx], keypts[visibleIdx].numpy(),
+                        camera['cameraMatrix'], camera['distCoeffs'])
+
+        #! Added on 2023/07/02
+        # Correction based on camera physics
+        z_max = 50 # [m]
+
+        if t[2] < 0 or t[2] > z_max:
+            # --- 1. Check z limit
+            reject = True
+        else:
+            # --- 2. Check xy limits based on estimated z distance
+            x_max = t[2] * np.tan(camera["horizontalFOV"]/2)
+            y_max = x_max / camera["Nu"] * camera["Nv"]
+
+            if t[0] < -x_max or t[0] > x_max or t[1] < -y_max or t[1] > y_max:
+                reject = True
+
+        return keypts, q, t, reject
+
+
+def solve_pose_from_heatmaps(heatmaps, image_size, threshold_bound, camera, keypts_true_3D):
+    from scipy.ndimage import map_coordinates
+
+    # heatmaps: [Nk x H x W]
+    nK, nH, nW = heatmaps.shape
+        
+    peakVal = np.zeros(nK)
+    peakY = np.zeros(nK)
+    peakX = np.zeros(nK)
+    peakYC = np.zeros(nK)
+    peakXC = np.zeros(nK)
+    for k in range(nK):
+        maxInd = heatmaps[k].argmax().item()
+        y = maxInd // nW
+        x = maxInd - nW * y
+        ymin = max(0,y-1)
+        ymax = min(nH-1,y+1)
+        xmin = max(0,x-1)
+        xmax = min(nW-1,x+1)
+        yrange = np.arange(ymin,ymax,0.125)
+        xrange = np.arange(xmin,xmax,0.125)
+        coord = np.stack([yrange.repeat(len(xrange)),np.tile(xrange,len(yrange))])
+        heatInterp = map_coordinates(heatmaps[k].numpy().astype('float32'),coord)
+        maxInterpInd = heatInterp.argmax()
+        peakVal[k] = heatInterp[maxInterpInd]
+        peakY[k] = coord[0,maxInterpInd]
+        peakX[k] = coord[1,maxInterpInd]
+        peakXC[k] = x
+        peakYC[k] = y
+
+    minNumPeaks = 5
+    threshold = np.sort(peakVal)[-minNumPeaks]
+    threshold = max(min(threshold, threshold_bound[1]),threshold_bound[0])
+    visibleIdx = peakVal >= threshold
+    peaks = np.stack([peakX*image_size[0]/nW, peakY*image_size[1]/nH, peakVal, visibleIdx]).transpose() # X (pix), Y (pix), Val, Visible
+
+    if np.sum(visibleIdx)<minNumPeaks:
+        reject = True
+        return peaks, None, None, reject
+    else:
+        reject = False
+    
+    # PnP
+    q, t = pnp(keypts_true_3D[visibleIdx], peaks[visibleIdx,:2], camera['cameraMatrix'], camera['distCoeffs'])
+
+    #! Added on 2023/07/02
+    # Correction based on camera physics
+    z_max = 50 # [m]
+
+    if t[2] < 0 or t[2] > z_max:
+        # --- 1. Check z limit
+        reject = True
+    else:
+        # --- 2. Check xy limits based on estimated z distance
+        x_max = t[2] * np.tan(camera["horizontalFOV"]/2)
+        y_max = x_max / camera["Nu"] * camera["Nv"]
+
+        if t[0] < -x_max or t[0] > x_max or t[1] < -y_max or t[1] > y_max:
+            reject = True
+
+    return peaks, q, t, reject
+
+
+def pnp(points_3D, points_2D, cameraMatrix, distCoeffs=None, rvec=None, tvec=None, useExtrinsicGuess=False):
+    if distCoeffs is None:
+        distCoeffs = np.zeros((5, 1), dtype=np.float32)
+
+    assert points_3D.shape[0] == points_2D.shape[0], 'points 3D and points 2D must have same number of vertices'
+
+    points_3D = np.ascontiguousarray(points_3D).reshape((-1,1,3))
+    points_2D = np.ascontiguousarray(points_2D).reshape((-1,1,2))
+
+    _, R_exp, t = cv2.solvePnP(points_3D,
+                               points_2D,
+                               cameraMatrix,
+                               distCoeffs, rvec, tvec, useExtrinsicGuess,
+                               flags=cv2.SOLVEPNP_EPNP)
+
+    R_pr, _ = cv2.Rodrigues(R_exp)
+
+    # To (q, t)
+    q = R.from_matrix(R_pr).as_quat() # [qvec, qcos]
+    t = np.squeeze(t)
+
+    return q[[3,0,1,2]], t
 
 
 class SpacecraftPoseMetric:
     def __init__(self, domain, spacecraft_cfg):
-        metric_names = ['effi_eR', 'effi_eT', 'effi_eR_HIL', 'effi_eT_norm_HIL', 'effi_pose']
+        metric_names = ['effi_eR', 'effi_eT', 'effi_eR_HIL', 'effi_eT_norm_HIL', 'effi_pose',
+                        'heat_eR', 'heat_eT', 'heat_eR_HIL', 'heat_eT_norm_HIL', 'heat_pose',
+                        'final_pose', 'heat_reject']
         self.metrics = {}
         self.domain = domain
         self.SPEED_THRESHOLD_Q = spacecraft_cfg.SPEED_THRESHOLD_Q
         self.SPEED_THRESHOLD_T = spacecraft_cfg.SPEED_THRESHOLD_T
         for name in metric_names:
-            self.metrics[name] = [] 
+            self.metrics[name] = []
+    
+    def update(self, predicts, targets):
+        batch_results = []
+        for b in range(len(predicts['bbox'])):
+            result = {}
 
-    def update(self, predicts, predicts_trans, predicts_rot, targets):
-        R_reg = []
-        t_reg = []
-        B = len(predicts)
-        #if len(predicts_trans)!=B or len(predicts_rot)!=B or len(targets)!=B:
-        #    print('SpacecraftPoseMetric warning: predicts batch sizes are different')
-        for b in range(len(predicts)):
-            if predicts[b].numel()==0:
-                continue
-            ind = torch.argmax(predicts[b][:,5])
-            R_pr    = rot_6d_to_matrix(predicts_rot[b][ind,:].to(torch.float32)).cpu().numpy()
-            t_pr    = predicts_trans[b][ind,:].to(torch.float32).cpu().numpy()
-            R_gt    = targets['rotationmatrix'][b,:,:].to(torch.float32).cpu().numpy()
-            t_gt    = targets['translation'][b,:].to(torch.float32).cpu().numpy()
+            # ground truth
+            R_gt    = targets['rotationmatrix'][b].to(torch.float32).cpu().numpy()
+            q_gt    = targets['quaternion'][b].to(torch.float32).cpu().numpy()
+            t_gt    = targets['translation'][b].to(torch.float32).cpu().numpy()
 
-            # Pose metric(s)
+            # heatmap
+            result = result | {'heat_reject':predicts['heat_reject'][b]}
+            if not predicts['heat_reject'][b]:
+                q_pr    = predicts['heat_rot'][b]
+                t_pr    = predicts['heat_trans'][b]
+                err_q = error_orientation(q_pr, q_gt, 'quaternion') # [deg]
+                err_t = error_translation(t_pr, t_gt)
+                speed_t, speed_q, speed = speed_score(t_pr, q_pr, t_gt, q_gt,
+                        representation='quaternion',
+                        applyThreshold=self.domain in ['lightbox', 'sunlamp'],
+                        theta_q=self.SPEED_THRESHOLD_Q,
+                        theta_t=self.SPEED_THRESHOLD_T)
+                result = result | {'heat_eR': err_q, 'heat_eT': err_t, 'heat_eR_HIL': speed_q, 'heat_eT_norm_HIL': speed_t, 'heat_pose': speed}
+
+            # pose
+            assert predicts['bbox'][b].numel()>0
+            R_pr    = rot_6d_to_matrix(predicts['pose_rot'][b].to(torch.float32)).cpu().numpy()
+            t_pr    = predicts['pose_trans'][b].to(torch.float32).cpu().numpy()
             err_q = error_orientation(R_pr, R_gt, 'rotationmatrix') # [deg]
             err_t = error_translation(t_pr, t_gt)
             speed_t, speed_q, speed = speed_score(t_pr, R_pr, t_gt, R_gt,
@@ -284,18 +464,24 @@ class SpacecraftPoseMetric:
                 applyThreshold=self.domain in ['lightbox', 'sunlamp'],
                 theta_q=self.SPEED_THRESHOLD_Q,
                 theta_t=self.SPEED_THRESHOLD_T)
+            result = result | {'effi_eR': err_q, 'effi_eT': err_t, 'effi_eR_HIL': speed_q, 'effi_eT_norm_HIL': speed_t, 'effi_pose': speed}
+
+            # final pose score
+            if not predicts['heat_reject'][b]:
+                result['final_pose'] = result['heat_eR_HIL'] + result['effi_eT_norm_HIL']
 
             # Save & record
-            R_reg.append(R_pr)
-            t_reg.append(t_pr)
-            result = {'_eR': err_q, '_eT': err_t, '_eR_HIL': speed_q, '_eT_norm_HIL': speed_t, '_pose': speed}
             for m, v in result.items():
-                self.metrics['effi'+m].append(v)
+                self.metrics[m].append(v)
+            batch_results.append(result)
+
+        return batch_results
 
     def compute(self) -> dict:
-        results = {'pose':np.mean(self.metrics['effi_pose']),
-                   'pose_t':np.mean(self.metrics['effi_eT_norm_HIL']),
-                   'pose_r':np.mean(self.metrics['effi_eR_HIL']),}
+        results = {}
+        for k,v in self.metrics.items():
+            results[k] = np.mean(v)
+        results['heat_reject'] = np.sum(self.metrics['heat_reject'])
         return results
 
     def reset(self):

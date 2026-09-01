@@ -21,9 +21,10 @@ class YOLO(nn.Module):
                    parameters, and any other relevant configuration details.
     """
 
-    def __init__(self, model_cfg: ModelConfig, class_num: int = 80):
+    def __init__(self, model_cfg: ModelConfig, class_num: int = 80, num_keypoints: int = 11):
         super(YOLO, self).__init__()
         self.num_classes = class_num
+        self.num_keypoints = num_keypoints
         self.layer_map = get_layer_map()  # Get the map Dict[str: Module]
         self.model: List[YOLOLayer] = nn.ModuleList()
         self.reg_max = getattr(model_cfg.anchor, "reg_max", 16)
@@ -53,6 +54,12 @@ class YOLO(nn.Module):
                         layer_args["in_channel"] = output_dim[source]
                     layer_args["num_classes"] = self.num_classes
                     layer_args["reg_max"] = self.reg_max
+                if any(module in layer_type for module in ["SpacecraftHeatmap"]):
+                    if isinstance(source, list):
+                        layer_args["in_channels"] = output_dim[source[0]]
+                    else:
+                        layer_args["in_channel"] = output_dim[source]
+                    layer_args["num_keypoints"] = self.num_keypoints
 
                 # create layers
                 layer = self.create_layer(layer_type, source, layer_info, **layer_args)
@@ -174,7 +181,12 @@ def create_model(model_cfg: ModelConfig, weight_path: Union[bool, Path] = True, 
         YOLO: An instance of the model defined by the given configuration.
     """
     OmegaConf.set_struct(model_cfg, False)
-    model = YOLO(model_cfg, class_num)
+
+    if dataset_cfg:
+        model = YOLO(model_cfg, class_num, num_keypoints=dataset_cfg.num_keypoints)
+    else:
+        model = YOLO(model_cfg, class_num)
+
     if dataset_cfg:
         camera_path = Path(dataset_cfg.path) / dataset_cfg.camera
         #cadmodel_path = Path(dataset_cfg.path) / dataset_cfg.cadmodel
@@ -185,6 +197,7 @@ def create_model(model_cfg: ModelConfig, weight_path: Union[bool, Path] = True, 
         #self.pose_loss = TransformationLoss(self.model_points)
         keypoints_path = Path(dataset_cfg.path) / dataset_cfg.keypoints
         model.keypts3d = load_tango_3d_keypoints(keypoints_path) # (11, 3) [m]
+        model.num_keypoints = model.keypts3d.shape[0]
     if weight_path:
         if weight_path == True:
             weight_path = Path("weights") / f"{model_cfg.name}.pt"

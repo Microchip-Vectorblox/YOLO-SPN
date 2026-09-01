@@ -12,7 +12,7 @@ data:
   cpu_num: ${cpu_num}
   shuffle: True
   pin_memory: True
-  style: 0.5 
+  style: 0.5
   data_augment:
     Mosaic: 0
     MixUp: 0 
@@ -21,7 +21,7 @@ data:
     HorizontalFlip: 0.0
     VerticalFlip: 0.0
     HorizontalVerticalFlip: 0.0
-    RandomSunFlare: 0
+    RandomSunFlare: 0.5
     GaussianBlur: 0.5
     GaussianNoise: 0.5
     RandomBrightness: 0.5
@@ -33,17 +33,18 @@ optimizer:
   type: SGD
   args:
     lr: 0.01
-    weight_decay: 0.0005
+    weight_decay: 0.0001
     momentum: 0.937
     nesterov: true
 
 loss:
   objective:
-    BCELoss: 0.5
-    BoxLoss: 7.5
-    DFLoss: 1.5
-    SPPosLoss: 14.0
+    BCELoss: 0.25 #0.5
+    BoxLoss: 3.5 #7.5
+    DFLoss: 0.5 #1.5
+    SPPosLoss: 10.0 #14.0
     SPRotLoss: 20.0
+    HeatLoss: 0.6 #0.0006
   aux:
     0.25
   matcher:

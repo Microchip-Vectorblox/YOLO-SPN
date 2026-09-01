@@ -75,6 +75,10 @@ model:
         source: [P3, P4, P5]
         tags: Main
         output: True
+    - SpacecraftHeatmap:
+        source: [P3]
+        tags: MainHeat
+        output: True
 
   auxiliary:
     - CBLinear:
@@ -128,4 +132,9 @@ model:
     - MultiheadSpacecraftPose:
         source: [A3, A4, A5]
         tags: AUX
+        output: True
+
+    - SpacecraftHeatmap:
+        source: [A3]
+        tags: AUXHeat
         output: True
