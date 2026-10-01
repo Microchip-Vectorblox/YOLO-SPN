@@ -49,16 +49,16 @@ def main(cfg: Config):
         model = BaseModel(cfg)
         model.eval().float().to('cpu')
         input_sample = torch.randn((1,3,cfg.image_size[1],cfg.image_size[0]))
-        #model.to_onnx('yolov9s-sp_73.onnx', input_sample, dynamo=True, external_data=False)
-        export_path = 'yolov9_export.onnx'
+        export_path = cfg.name+'.onnx'
+        #model.to_onnx(export_path, input_sample, dynamo=True, external_data=False)        
         with torch.inference_mode():
             torch.onnx.export(
                 model,
                 input_sample,
                 export_path,
-                opset_version=13,
                 external_data=False,
                 dynamo=True,
+                opset_version=13,
             )
 
 

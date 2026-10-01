@@ -33,13 +33,13 @@ optimizer:
   type: SGD
   args:
     lr: 0.01
-    weight_decay: 0.0001
+    weight_decay: 0.0005
     momentum: 0.937
     nesterov: true
 
 loss:
   objective:
-    BCELoss: 0.25 #0.5
+    BCELoss: 0.5
     BoxLoss: 3.5 #7.5
     DFLoss: 0.5 #1.5
     SPPosLoss: 10.0 #14.0

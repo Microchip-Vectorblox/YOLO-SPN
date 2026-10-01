@@ -52,6 +52,17 @@ class ValidateModel(BaseModel):
                 self.sp_metric = [SpacecraftPoseMetric('val', self.validation_cfg.spacecraft)]
         self.ema = self.model
 
+        # debugging
+        self.pos0used = []
+        self.pos1used = []
+        self.pos2used = []
+        self.pos0var = []
+        self.pos1var = []
+        self.pos2var = []
+        self.pos0mean = []
+        self.pos1mean = []
+        self.pos2mean = []
+
     def setup(self, stage):
         self.vec2box = create_converter(
             self.cfg.model.name, self.model, self.cfg.model.anchor, self.cfg.image_size, self.device
@@ -142,7 +153,7 @@ class ValidateModel(BaseModel):
             for nc in connections:
                 line = (kp[0,nc[0]],kp[1,nc[0]],kp[0,nc[1]],kp[1,nc[1]])
                 draw.line(line, fill="red", width=1)
-            if not predict['heat_reject']:
+            if 0: #not predict['heat_reject']:
                 for n in range(kh.shape[1]):
                     draw.circle(kh[:,n],3,fill="yellow")
                 for nc in connections:
@@ -150,14 +161,14 @@ class ValidateModel(BaseModel):
                     draw.line(line, fill="yellow", width=1)
             draw.text((0,0),f"pose: {metric['effi_eR']:.4f}, {metric['effi_eT']:.4f} (deg,m?)", fill="red", font=font)
             draw.text((0,30),f"pose: {metric['effi_eR_HIL']:.4f}, {metric['effi_eT_norm_HIL']:.4f}, {metric['effi_pose']:.4f} (rot,trans,final)", fill="red", font=font)
-            if not predict['heat_reject']:
+            if 0: #not predict['heat_reject']:
                 draw.text((0,60),f"heat: {metric['heat_eR']:.4f}, {metric['heat_eT']:.4f} (deg,m?)", fill="yellow", font=font)
                 draw.text((0,90),f"heat: {metric['heat_eR_HIL']:.4f}, {metric['heat_eT_norm_HIL']:.4f}, {metric['heat_pose']:.4f} (rot,trans,final)", fill="yellow", font=font)
-            # heatmap peaks
-            for n in range(heat_peaks.shape[0]):
-                if heat_peaks[n,3]:
-                    draw.circle(heat_peaks[n,:],3,fill="blue")
-                    draw.text(heat_peaks[n,:], str(n+1), fill="blue", font=font)
+                # heatmap peaks
+                for n in range(heat_peaks.shape[0]):
+                    if heat_peaks[n,3]:
+                        draw.circle(heat_peaks[n,:],3,fill="blue")
+                        draw.text(heat_peaks[n,:], str(n+1), fill="blue", font=font)
             #for n in range(khi.shape[1]):
             #    draw.circle(khi[:,n],3,fill="yellow")
             #for nc in connections:
@@ -206,9 +217,28 @@ class ValidateModel(BaseModel):
         batch_size, images, targets, rev_tensor, img_paths = batch
         H, W = images.shape[2:]
         if self.spacecraft_pose:
-            predicts = self.post_process(self.ema(images), image_size=[W, H])
+            x = self.ema(images)
+            predicts = self.post_process(x, image_size=[W, H])
             batch_metrics = self.sp_metric[dataloader_idx].update(predicts, targets)
             if self.debug:
+                val0,ind0 = x['Main'][0][0].flatten(start_dim=2, end_dim=3).max(dim=2)
+                val1,ind1 = x['Main'][1][0].flatten(start_dim=2, end_dim=3).max(dim=2)
+                val2,ind2 = x['Main'][2][0].flatten(start_dim=2, end_dim=3).max(dim=2)
+                for b in range(val0.shape[0]):
+                    if val0[b]>val1[b] and val0[b]>val2[b]:
+                        self.pos0used.append(x['Main'][0][3].flatten(start_dim=2, end_dim=3)[b,:,ind0[b]])
+                    elif val1[b]>val2[b]:
+                        self.pos1used.append(x['Main'][1][3].flatten(start_dim=2, end_dim=3)[b,:,ind1[b]])
+                    else:
+                        self.pos2used.append(x['Main'][2][3].flatten(start_dim=2, end_dim=3)[b,:,ind2[b]])
+                self.pos0var.append(x['Main'][0][3].var(dim=(0,2,3)))
+                self.pos1var.append(x['Main'][1][3].var(dim=(0,2,3)))
+                self.pos2var.append(x['Main'][2][3].var(dim=(0,2,3)))
+                self.pos0mean.append(x['Main'][0][3].mean(dim=(0,2,3)))
+                self.pos1mean.append(x['Main'][1][3].mean(dim=(0,2,3)))
+                self.pos2mean.append(x['Main'][2][3].mean(dim=(0,2,3)))
+
+            if 0:    
                 import torch
                 import numpy as np
                 peak_err = np.array([])
@@ -261,6 +291,7 @@ class TrainModel(ValidateModel):
         super().__init__(cfg)
         self.cfg = cfg
         self.train_loader = create_dataloader(self.cfg.task.data, self.cfg.dataset, self.cfg.task.task)
+        self.save_hyperparameters(cfg)
         #img, targets, rev_tensor, img_path = self.train_loader.dataset.__getitem__(0)
         #print('hi')
 
