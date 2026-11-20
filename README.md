@@ -76,12 +76,12 @@ python yolo/lazy.py task=export \
 
 ## Training Results on SPEED+
 
-|      |     |       |validation|      |     |       |lightbox |       |     |       | sunlamp |       |
-| :--- |:---:| :---: |  :---:  | :---: |:---:| :---: |  :---:  | :---: |:---:| :---: |  :---:  | :---: |
-|      |┃    |E_T [m]|E_R [deg]|E_pose |┃    |E_T [m]|E_R [deg]|E_pose |┃    |E_T [m]|E_R [deg]|E_pose |
-| v9t  |┃    | 0.0913| 3.0019  | 0.0683|┃    | 0.5193| 29.8049 | 0.6086|┃    | 0.4076| 29.2459 | 0.5728|
-| v9s  |┃    | 0.0596| 1.8506  | 0.0427|┃    | 0.4112| 21.4174 | 0.4431|┃    | 0.3441| 22.0753 | 0.4381|
-| v9m  |┃    | 0.0338| 1.0219  | 0.0236|┃    | 0.2721| 13.6424 | 0.2837|┃    | 0.2396| 14.3342 | 0.2895|
+|      |       |validation|      |       |lightbox |       |       | sunlamp |       |
+| :--- | :---: |  :---:  | :---: | :---: |  :---:  | :---: | :---: |  :---:  | :---: |
+|      |E_T [m]|E_R [deg]|E_pose |E_T [m]|E_R [deg]|E_pose |E_T [m]|E_R [deg]|E_pose |
+| v9t  | 0.0913| 3.0019  | 0.0683| 0.5193| 29.8049 | 0.6086| 0.4076| 29.2459 | 0.5728|
+| v9s  | 0.0596| 1.8506  | 0.0427| 0.4112| 21.4174 | 0.4431| 0.3441| 22.0753 | 0.4381|
+| v9m  | 0.0338| 1.0219  | 0.0236| 0.2721| 13.6424 | 0.2837| 0.2396| 14.3342 | 0.2895|
 
 The lightbox and sunlamp datasets are quite different from the training and validation set. To improve performance, more image augmentations were enabled as done in SPNv2. These were trained with style, coarse dropout, and random sun flare. These results could likely be further improved with hyperparameter optimization.
 
