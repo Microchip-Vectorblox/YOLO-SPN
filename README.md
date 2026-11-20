@@ -1,139 +1,102 @@
-# YOLO: Official Implementation of YOLOv9, YOLOv7, YOLO-RD
+# YOLO-SPN: Fast Spacecraft Pose Estimation
 
-[![Documentation Status](https://readthedocs.org/projects/yolo-docs/badge/?version=latest)](https://yolo-docs.readthedocs.io/en/latest/?badge=latest)
-![GitHub License](https://img.shields.io/github/license/WongKinYiu/YOLO)
+This repository was created by Alden Doyle at Microchip Technology. This was forked from the MIT-licensed [YOLOv9](https://github.com/MultimediaTechLab/YOLO) repository and adds the features for spacecraft pose esimtation as done in [SPNv2](https://github.com/tpark94/spnv2). The motivation is to perform spacecraft pose estimation with a more efficient model architecture.
 
-[![Developer Mode Build & Test](https://github.com/WongKinYiu/YOLO/actions/workflows/develop.yaml/badge.svg)](https://github.com/WongKinYiu/YOLO/actions/workflows/develop.yaml)
-[![Deploy Mode Validation & Inference](https://github.com/WongKinYiu/YOLO/actions/workflows/deploy.yaml/badge.svg)](https://github.com/WongKinYiu/YOLO/actions/workflows/deploy.yaml)
-
-
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)]()
-[![Hugging Face Spaces](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Spaces-green)](https://huggingface.co/spaces/henry000/YOLO)
-
-<!-- > [!IMPORTANT]
-> This project is currently a Work In Progress and may undergo significant changes. It is not recommended for use in production environments until further notice. Please check back regularly for updates.
->
-> Use of this code is at your own risk and discretion. It is advisable to consult with the project owner before deploying or integrating into any critical systems. -->
-
-Welcome to the official implementation of YOLOv7[^1] and YOLOv9[^2], YOLO-RD[^3]. This repository will contains the complete codebase, pre-trained models, and detailed instructions for training and deploying YOLOv9.
-
-## TL;DR
-
-- This is the official YOLO model implementation with an MIT License.
-- For quick deployment: you can directly install by pip+git:
-
-```shell
-pip install git+https://github.com/WongKinYiu/YOLO.git
-yolo task.data.source=0 # source could be a single file, video, image folder, webcam ID
-```
-
-## Introduction
-
-- [**YOLOv9**: Learning What You Want to Learn Using Programmable Gradient Information](https://arxiv.org/abs/2402.13616)
-- [**YOLOv7**: Trainable Bag-of-Freebies Sets New State-of-the-Art for Real-Time Object Detectors](https://arxiv.org/abs/2207.02696)
-- [**YOLO-RD**: Introducing Relevant and Compact Explicit Knowledge to YOLO by Retriever-Dictionary](https://arxiv.org/abs/2410.15346)
+![output.png](./images/output.png)
 
 ## Installation
 
-To get started using YOLOv9's developer mode, we recommand you clone this repository and install the required dependencies:
+To get started, we recommand you clone this repository and install the required dependencies:
 
 ```shell
-git clone git@github.com:WongKinYiu/YOLO.git
-cd YOLO
+git clone git@github.com:Microchip-Vectorblox/YOLO-SPN.git
+cd YOLO-SPN
 pip install -r requirements.txt
 ```
 
-## Features
+## Tasks
 
-<table>
-<tr><td>
+This was tested with a synthetic dataset created by SPIN and also with the Speed+ dataset. 
 
-## Task
+### Training
 
-These are simple examples. For more customization details, please refer to [Notebooks](examples) and lower-level modifications **[HOWTO](docs/HOWTO.md)**.
-
-## Training
-
-To train YOLO on your machine/dataset:
+To train YOLO-SPN on your machine/dataset:
 
 1. Modify the configuration file `yolo/config/dataset/**.yaml` to point to your dataset.
 2. Run the training script:
 
 ```shell
-python yolo/lazy.py task=train dataset=** use_wandb=True
-python yolo/lazy.py task=train task.data.batch_size=8 model=v9-c weight=False # or more args
-```
 
-### Transfer Learning
-
-To perform transfer learning with YOLOv9:
-
-```shell
-python yolo/lazy.py task=train task.data.batch_size=8 model=v9-c dataset={dataset_config} device={cpu, mps, cuda}
-```
-
-### Inference
-
-To use a model for object detection, use:
-
-```shell
-python yolo/lazy.py # if cloned from GitHub
-python yolo/lazy.py task=inference \ # default is inference
-                    name=AnyNameYouWant \ # AnyNameYouWant
-                    device=cpu \ # hardware cuda, cpu, mps
-                    model=v9-s \ # model version: v9-c, m, s
-                    task.nms.min_confidence=0.1 \ # nms config
-                    task.fast_inference=onnx \ # onnx, trt, deploy
-                    task.data.source=data/toy/images/train \ # file, dir, webcam
-                    +quiet=True \ # Quiet Output
-yolo task.data.source={Any Source} # if pip installed
-yolo task=inference task.data.source={Any}
+python yolo/lazy.py task=train
+    weight=weights/v9-s.pt \ # start with COCO-trained weights
+    model=v9-s-sp \          # select "t", "s", or "m" size
+    use_wandb=False \
+    dataset='spinrgb' \      # dataset config
+    use_tensorboard=True \
+    image_size=[768,512] \   # default input shape
+    name=v9-s-sp
 ```
 
 ### Validation
 
-To validate model performance, or generate a json file in COCO format:
+To validate model performance.
 
 ```shell
-python yolo/lazy.py task=validation
-python yolo/lazy.py task=validation dataset=toy
+python yolo/lazy.py task=validation \
+    weight='runs/train/v9-s-sp/lightning_logs/version_1/checkpoints/final.ckpt' \ # model checkpoint
+    model=v9-s-sp \
+    use_wandb=False \
+    dataset='spinrgb' \
+    image_size=[768,512] \
+    name=v9-s-sp
 ```
 
-## Contributing
+### Export
 
-Contributions to the YOLO project are welcome! See [CONTRIBUTING](docs/CONTRIBUTING.md) for guidelines on how to contribute.
+To export a saved checkpoint to an onnx file:
 
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=MultimediaTechLab/YOLO&type=Date)](https://star-history.com/#MultimediaTechLab/YOLO&Date)
-
-## Citations
-
-```
-@inproceedings{wang2022yolov7,
-      title={{YOLOv7}: Trainable Bag-of-Freebies Sets New State-of-the-Art for Real-Time Object Detectors},
-      author={Wang, Chien-Yao and Bochkovskiy, Alexey and Liao, Hong-Yuan Mark},
-      year={2023},
-      booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
-
-}
-@inproceedings{wang2024yolov9,
-      title={{YOLOv9}: Learning What You Want to Learn Using Programmable Gradient Information},
-      author={Wang, Chien-Yao and Yeh, I-Hau and Liao, Hong-Yuan Mark},
-      year={2024},
-      booktitle={Proceedings of the European Conference on Computer Vision (ECCV)},
-}
-@inproceedings{tsui2024yolord,
-      author={Tsui, Hao-Tang and Wang, Chien-Yao and Liao, Hong-Yuan Mark},
-      title={{YOLO-RD}: Introducing Relevant and Compact Explicit Knowledge to YOLO by Retriever-Dictionary},
-      booktitle={Proceedings of the International Conference on Learning Representations (ICLR)},
-      year={2025},
-}
-
+```shell
+python yolo/lazy.py task=export \
+    weight='runs/train/v9-s-sp/lightning_logs/version_1/checkpoints/final.ckpt' \ # model checkpoint
+    model=v9-s-sp \
+    use_wandb=False \
+    dataset='spinrgb' \
+    image_size=[768,512] \
+    name=yolov9s-spn_spin1_768x512 # .onnx file name
 ```
 
-[^1]: [**YOLOv7**: Trainable Bag-of-Freebies Sets New State-of-the-Art for Real-Time Object Detectors](https://arxiv.org/abs/2207.02696)
+## Training Results on SPIN
 
-[^2]: [**YOLOv9**: Learning What You Want to Learn Using Programmable Gradient Information](https://arxiv.org/abs/2402.13616)
+|      |       |validation|       |
+| :--- | :---: |  :---:   | :---: |
+|      |E_T [m]| E_R [deg]| E_pose|
+| v9t  | 0.0462| 1.5541   | 0.0353|
+| v9s  | 0.0315| 0.9817   | 0.0228|
+| v9m  | 0.0205| 0.6840   | 0.0156|
 
-[^3]: [**YOLO-RD**: Introducing Relevant and Compact Explicit Knowledge to YOLO by Retriever-Dictionary](https://arxiv.org/abs/2410.15346)
+## Training Results on SPEED+
+
+|      |     |       |validation|      |     |       |lightbox |       |     |       | sunlamp |       |
+| :--- |:---:| :---: |  :---:  | :---: |:---:| :---: |  :---:  | :---: |:---:| :---: |  :---:  | :---: |
+|      |┃    |E_T [m]|E_R [deg]|E_pose |┃    |E_T [m]|E_R [deg]|E_pose |┃    |E_T [m]|E_R [deg]|E_pose |
+| v9t  |┃    | 0.0913| 3.0019  | 0.0683|┃    | 0.5193| 29.8049 | 0.6086|┃    | 0.4076| 29.2459 | 0.5728|
+| v9s  |┃    | 0.0596| 1.8506  | 0.0427|┃    | 0.4112| 21.4174 | 0.4431|┃    | 0.3441| 22.0753 | 0.4381|
+| v9m  |┃    | 0.0338| 1.0219  | 0.0236|┃    | 0.2721| 13.6424 | 0.2837|┃    | 0.2396| 14.3342 | 0.2895|
+
+The lightbox and sunlamp datasets are quite different from the training and validation set. To improve performance, more image augmentations were enabled as done in SPNv2. These were trained with style, coarse dropout, and random sun flare. These results could likely be further improved with hyperparameter optimization.
+
+Example training script:
+```shell
+python yolo/lazy.py task=train weight=weights/v9-s.pt model=v9-s-sp use_wandb=False dataset='speedplus' use_tensorboard=True image_size=[768,512] name=v9-s-sp task.data.batch_size=32 task.data.equivalent_batch_size=32 task.data.style=0.5 task.data.data_augment.CoarseDropout=0.5 task.data.data_augment.RandomSunFlare=0.5
+```
+## References
+### Papers
+
+- [**YOLOv9**: Learning What You Want to Learn Using Programmable Gradient Information](https://arxiv.org/abs/2402.13616)
+- [**SPNv2**: Robust Multi-Task Learning and Online Refinement for Spacecraft Pose Estimation across Domain Gap](https://arxiv.org/abs/2203.04275)
+- [**SPIN**: Spacecraft Imagery for Navigation](https://arxiv.org/abs/2406.07500)
+
+### Repositories
+- [**YOLO**: Official Implementation of YOLOv9, YOLOv7, YOLO-RD](https://github.com/MultimediaTechLab/YOLO)
+- [**SPNv2**: Robust Multi-task Learning and Online Refinement for Spacecraft Pose Estimation across Domain Gap](https://github.com/tpark94/spnv2)
+- [**SPIN**: An Open Simulator of Realistic Spacecraft Navigation Imagery](https://github.com/vpulab/SPIN)
